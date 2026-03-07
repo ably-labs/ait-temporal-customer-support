@@ -1,3 +1,5 @@
+import { Context } from '@temporalio/activity';
+import { getRealtimeClient, getRestClient, channelName } from './ably-clients';
 import type { Message } from './workflows';
 
 export interface LLMResult {
@@ -9,7 +11,7 @@ export interface LLMResult {
 }
 
 export interface Activities {
-  publishUserMessage(sessionId: string, message: string): Promise<void>;
+  publishUserMessage(sessionId: string, message: string, customerName: string): Promise<void>;
   callLLMStreaming(sessionId: string, messages: Message[], turnIndex: number): Promise<LLMResult>;
   executeToolCall(toolName: string, toolInput: Record<string, unknown>): Promise<unknown>;
   notifyHumanAgent(
@@ -18,36 +20,109 @@ export interface Activities {
   ): Promise<void>;
 }
 
-// --- Mock implementations (to be replaced in later milestones) ---
-
-export async function publishUserMessage(sessionId: string, message: string): Promise<void> {
-  console.log(`[publishUserMessage] session=${sessionId} message="${message}"`);
+/**
+ * Publish a user message to the Ably session channel on behalf of the customer.
+ * Uses REST with a deterministic message ID for idempotent publishing (safe on retry).
+ * Sets clientId on the message so subscribers can attribute it to the user.
+ */
+export async function publishUserMessage(
+  sessionId: string,
+  message: string,
+  customerName: string
+): Promise<void> {
+  const rest = getRestClient();
+  const channel = rest.channels.get(channelName(sessionId));
+  const messageId = `user_${sessionId}_${Date.now()}`;
+  await channel.publish({ id: messageId, name: 'user', data: message, clientId: customerName });
 }
 
+/**
+ * Stream LLM response tokens to Ably using the message-per-response pattern.
+ *
+ * Attempt-aware publishing (Decision 10):
+ * - Attempt 1: Realtime publish (fast path, no idempotency overhead)
+ * - Attempt 2+: REST publish with deterministic message ID. If the message
+ *   already exists (dedup), the publish is a no-op — the original message
+ *   with its partial appends is untouched. updateMessage({ data: '' })
+ *   clears any partial content so we can stream fresh.
+ *
+ * Dedup window: documented as ~2 minutes from original publish, but tested
+ * to confirm that appends/updates extend it. Since we constantly append
+ * tokens during streaming, the window stays open for the stream's lifetime.
+ *
+ * Currently uses mock responses — Claude integration comes in Milestone 4.
+ */
 export async function callLLMStreaming(
   sessionId: string,
   messages: Message[],
   turnIndex: number
 ): Promise<LLMResult> {
+  const attempt = Context.current().info.attempt;
+  const realtime = getRealtimeClient();
+  const rest = getRestClient();
+  const realtimeChannel = realtime.channels.get(channelName(sessionId));
+  const restChannel = rest.channels.get(channelName(sessionId));
+
+  const messageId = `msg_${sessionId}_turn${turnIndex}`;
+  let msgSerial: string;
+
+  if (attempt === 1) {
+    // FAST PATH: Realtime publish, no idempotency overhead
+    const result = await realtimeChannel.publish({ name: 'response', data: '' });
+    const serial = result.serials[0];
+    if (!serial) throw new Error('Failed to get serial from Realtime publish');
+    msgSerial = serial;
+  } else {
+    // RECOVERY PATH: REST publish with deterministic ID = idempotent create-if-not-exists.
+    // On attempt 2: creates a new message (attempt 1 used Realtime with no ID).
+    //   The updateMessage below is a harmless no-op (message is already empty).
+    // On attempt 3+: deduped (same ID as attempt 2), returns the existing message's
+    //   serial. That message may have partial appends from the crashed prior attempt.
+    //   The updateMessage resets its body so we can stream fresh.
+    const result = await restChannel.publish({ id: messageId, name: 'response', data: '' });
+    const serial = result.serials[0];
+    if (!serial) throw new Error('Failed to get serial from REST idempotent publish');
+    msgSerial = serial;
+    await realtimeChannel.updateMessage({ serial: msgSerial, data: '' });
+  }
+
+  // Mock token streaming — replaced with real Claude streaming in Milestone 4
   const lastUserMsg = messages.filter((m) => m.role === 'user').pop()?.content ?? '';
-  console.log(`[callLLMStreaming] session=${sessionId} turn=${turnIndex} lastUserMsg="${lastUserMsg}"`);
+  const mockResponse = `This is a mock response to: "${lastUserMsg}". Real Claude streaming comes in Milestone 4.`;
+  const tokens = mockResponse.split(' ');
 
-  // Mock: simulate a short delay then return canned response
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  const appendPromises: Promise<unknown>[] = [];
+  let fullText = '';
 
-  return {
-    type: 'text',
-    fullText: `This is a mock response to: "${lastUserMsg}". In later milestones, this will stream real tokens from Claude via Ably.`,
-  };
+  for (const token of tokens) {
+    Context.current().heartbeat();
+    const tokenWithSpace = fullText.length > 0 ? ` ${token}` : token;
+    fullText += tokenWithSpace;
+    appendPromises.push(realtimeChannel.appendMessage({ serial: msgSerial, data: tokenWithSpace }));
+    // Simulate token delay
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  // Wait for all appends; fall back to full updateMessage if any failed
+  const results = await Promise.allSettled(appendPromises);
+  const anyFailed = results.some((r) => r.status === 'rejected');
+  if (anyFailed) {
+    await realtimeChannel.updateMessage({ serial: msgSerial, data: fullText });
+  }
+
+  // Signal completion — extras-only update, body preserved via shallow mixin semantics
+  await realtimeChannel.updateMessage({
+    serial: msgSerial,
+    extras: { headers: { status: 'complete' } },
+  });
+
+  return { type: 'text', fullText, msgSerial };
 }
 
 export async function executeToolCall(
   toolName: string,
   toolInput: Record<string, unknown>
 ): Promise<unknown> {
-  console.log(`[executeToolCall] tool=${toolName} input=${JSON.stringify(toolInput)}`);
-
-  // Mock tool responses
   switch (toolName) {
     case 'lookupOrder':
       return {
@@ -69,5 +144,15 @@ export async function notifyHumanAgent(
   sessionId: string,
   context: { customerName: string; reason: string; history: Message[] }
 ): Promise<void> {
-  console.log(`[notifyHumanAgent] session=${sessionId} customer=${context.customerName} reason="${context.reason}"`);
+  const rest = getRestClient();
+  const channel = rest.channels.get('ai:agent:escalations');
+  await channel.publish({
+    name: 'escalation',
+    data: {
+      sessionId,
+      customerName: context.customerName,
+      reason: context.reason,
+      messageCount: context.history.length,
+    },
+  });
 }

@@ -49,8 +49,8 @@ export async function supportSessionWorkflow(
 
     messages.push({ role: 'user', content: userMsg });
 
-    // Publish user message to Ably channel
-    await activities.publishUserMessage(sessionId, userMsg);
+    // Publish user message to Ably channel on behalf of the customer
+    await activities.publishUserMessage(sessionId, userMsg, customerName);
 
     // Call LLM (streaming tokens to Ably inside the activity)
     const llmResult = await activities.callLLMStreaming(sessionId, messages, turnIndex);
