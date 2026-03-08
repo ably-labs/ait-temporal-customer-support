@@ -14,7 +14,7 @@ export interface LLMResult {
 }
 
 export interface Activities {
-  publishUserMessage(sessionId: string, message: string, customerName: string): Promise<void>;
+  publishUserMessage(sessionId: string, message: string, customerName: string, messageId: string): Promise<void>;
   callLLMStreaming(sessionId: string, messages: Message[], turnIndex: number): Promise<LLMResult>;
   executeToolCall(toolName: string, toolInput: Record<string, unknown>): Promise<unknown>;
   notifyHumanAgent(
@@ -31,11 +31,11 @@ export interface Activities {
 export async function publishUserMessage(
   sessionId: string,
   message: string,
-  customerName: string
+  customerName: string,
+  messageId: string
 ): Promise<void> {
   const rest = getRestClient();
   const channel = rest.channels.get(channelName(sessionId));
-  const messageId = `user_${sessionId}_${Date.now()}`;
   await channel.publish({ id: messageId, name: 'user', data: message, clientId: customerName });
 }
 

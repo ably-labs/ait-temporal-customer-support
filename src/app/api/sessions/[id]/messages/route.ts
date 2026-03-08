@@ -8,9 +8,13 @@ export async function POST(
   const { id: sessionId } = await params;
   const body = await request.json();
   const message = body.message;
+  const messageId = body.messageId;
 
   if (!message || typeof message !== 'string') {
     return NextResponse.json({ error: 'message is required' }, { status: 400 });
+  }
+  if (!messageId || typeof messageId !== 'string') {
+    return NextResponse.json({ error: 'messageId is required' }, { status: 400 });
   }
 
   const workflowId = `support-${sessionId}`;
@@ -18,7 +22,7 @@ export async function POST(
 
   try {
     const handle = client.workflow.getHandle(workflowId);
-    await handle.signal('userMessage', message);
+    await handle.signal('userMessage', message, messageId);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     return NextResponse.json({ error: `Failed to signal workflow: ${message}` }, { status: 404 });

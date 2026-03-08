@@ -2,7 +2,7 @@ import { proxyActivities, setHandler, condition, defineSignal } from '@temporali
 import type { Activities } from './activities';
 
 // Signal definitions
-export const userMessage = defineSignal<[string]>('userMessage');
+export const userMessage = defineSignal<[string, string]>('userMessage');
 export const humanAgentResponse = defineSignal<[{ action: string; message?: string }]>('humanAgentResponse');
 
 
@@ -29,13 +29,13 @@ export async function supportSessionWorkflow(
   customerName: string
 ): Promise<void> {
   const messages: Message[] = [];
-  let pendingUserMessage: string | null = null;
+  let pendingUserMessage: { text: string; messageId: string } | null = null;
   let status: 'active' | 'escalated' | 'resolved' = 'active';
   let humanDecision: { action: string; message?: string } | null = null;
 
   // Signal handlers
-  setHandler(userMessage, (msg: string) => {
-    pendingUserMessage = msg;
+  setHandler(userMessage, (msg: string, messageId: string) => {
+    pendingUserMessage = { text: msg, messageId };
   });
 
   setHandler(humanAgentResponse, (decision) => {
@@ -49,13 +49,13 @@ export async function supportSessionWorkflow(
     // Durable wait — zero compute, survives crashes
     await condition(() => pendingUserMessage !== null);
 
-    const userMsg = pendingUserMessage!;
+    const { text: userMsg, messageId } = pendingUserMessage!;
     pendingUserMessage = null;
 
     messages.push({ role: 'user', content: userMsg });
 
     // Publish user message to Ably channel on behalf of the customer
-    await activities.publishUserMessage(sessionId, userMsg, customerName);
+    await activities.publishUserMessage(sessionId, userMsg, customerName, messageId);
 
     // Call LLM (streaming tokens to Ably inside the activity)
     const llmResult = await activities.callLLMStreaming(sessionId, messages, turnIndex);
