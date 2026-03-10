@@ -60,30 +60,38 @@ export async function supportSessionWorkflow(
 
   let turnIndex = 0;
 
-  while (status !== 'resolved') {
-    // Durable wait — zero compute, survives crashes
-    await condition(() => pendingUserMessage !== null);
+  try {
+    while (status !== 'resolved') {
+      // Durable wait — zero compute, survives crashes
+      await condition(() => pendingUserMessage !== null);
 
-    const { text: userMsg, messageId } = pendingUserMessage!;
-    pendingUserMessage = null;
+      const { text: userMsg, messageId } = pendingUserMessage!;
+      pendingUserMessage = null;
 
-    messages.push({ role: 'user', content: userMsg });
+      messages.push({ role: 'user', content: userMsg });
 
-    // Publish user message to Ably channel on behalf of the customer
-    await activities.publishUserMessage(sessionId, userMsg, customerName, messageId);
+      // Publish user message to Ably channel on behalf of the customer
+      await activities.publishUserMessage(sessionId, userMsg, customerName, messageId);
 
-    // If escalated, forward customer messages to the human agent — don't call AI
-    if (status === 'escalated') {
-      await activities.notifyHumanAgent(sessionId, {
-        customerName,
-        reason: `Customer sent a follow-up message: "${userMsg}"`,
-        history: messages,
-      });
-      continue;
+      // If escalated, forward customer messages to the human agent — don't call AI
+      if (status === 'escalated') {
+        await activities.notifyHumanAgent(sessionId, {
+          customerName,
+          reason: `Customer sent a follow-up message: "${userMsg}"`,
+          history: messages,
+        });
+        continue;
+      }
+
+      // Run the AI turn — may be cancelled by steerGeneration signal
+      await runAITurn();
     }
-
-    // Run the AI turn — may be cancelled by steerGeneration signal
-    await runAITurn();
+  } finally {
+    // Clean up the per-session Ably client when the workflow completes.
+    // This closes the connection, triggering automatic presence leave.
+    await CancellationScope.nonCancellable(async () => {
+      await activities.cleanupSessionClient(sessionId);
+    });
   }
 
   /**
@@ -98,8 +106,6 @@ export async function supportSessionWorkflow(
    * and `executeToolCall` sends `status: 'cancelled'` before rethrowing.
    */
   async function runAITurn(): Promise<void> {
-    await activities.enterAgentPresence(sessionId);
-
     // Checkpoint: snapshot agent state before this turn
     const checkpoint = messages.length;
 
@@ -152,9 +158,7 @@ export async function supportSessionWorkflow(
       activeLLMScope = null;
     }
 
-    // After cancellation, handle the steer action — then leave presence.
-    // Presence leave must happen AFTER any notifications so the frontend
-    // receives them in order (message first, then presence leave).
+    // After cancellation, handle the steer action.
     if (steerAction) {
       const action = steerAction;
       steerAction = null;
@@ -170,14 +174,6 @@ export async function supportSessionWorkflow(
           );
         });
       }
-    }
-
-    // Leave presence after all post-cancellation work is done.
-    // Skip if handleEscalation already left presence before its wait loop.
-    if (status !== 'escalated' && status !== 'resolved') {
-      await CancellationScope.nonCancellable(async () => {
-        await activities.leaveAgentPresence(sessionId);
-      });
     }
   }
 
@@ -198,11 +194,6 @@ export async function supportSessionWorkflow(
       reason: llmResult.toolInput?.reason as string || llmResult.fullText,
       history: messages,
     });
-
-    // Leave AI presence before entering the escalation wait loop.
-    // The AI is no longer actively working — a human agent will take over.
-    // Without this, the customer sees "AI is thinking..." during the entire escalation.
-    await activities.leaveAgentPresence(sessionId);
 
     let agentHasJoined = false;
 

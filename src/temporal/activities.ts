@@ -1,5 +1,5 @@
 import { Context, CancelledFailure } from '@temporalio/activity';
-import { getRealtimeClient, getRestClient, channelName } from './ably-clients';
+import { getRealtimeClient, getRestClient, getSessionRealtimeClient, closeSessionClient, channelName } from './ably-clients';
 import { streamClaude } from './llm';
 import type { Message } from './workflows';
 
@@ -63,8 +63,7 @@ export interface Activities {
     status: 'responding' | 'resolved' | 'dismissed',
     sessionId: string
   ): Promise<void>;
-  enterAgentPresence(sessionId: string): Promise<void>;
-  leaveAgentPresence(sessionId: string): Promise<void>;
+  cleanupSessionClient(sessionId: string): Promise<void>;
 }
 
 /**
@@ -126,6 +125,12 @@ export async function callLLMStreaming(
   const rest = getRestClient();
   const realtimeChannel = realtime.channels.get(channelName(sessionId));
   const restChannel = rest.channels.get(channelName(sessionId));
+
+  // Enter presence using the per-session client so the frontend sees the agent as active.
+  // This ensures enter/leave happen on the same connection even across Temporal retries.
+  const sessionClient = getSessionRealtimeClient(sessionId);
+  const presenceChannel = sessionClient.channels.get(channelName(sessionId));
+  await presenceChannel.presence.enter({ status: 'processing' });
 
   const messageId = `msg_${sessionId}_turn${turnIndex}`;
   let msgSerial: string;
@@ -212,10 +217,15 @@ export async function callLLMStreaming(
     extras: { headers: { status: terminalStatus } },
   });
 
-  // If aborted by cancellation, rethrow so the workflow's CancellationScope handles it
+  // If aborted by cancellation, leave presence and rethrow
   if (aborted) {
+    await presenceChannel.presence.leave();
     throw new CancelledFailure('LLM streaming aborted');
   }
+
+  // Leave presence with handing-over status — more steps may follow (tool calls, follow-up LLM).
+  // The client determines terminal state from the message completion signal.
+  await presenceChannel.presence.leave({ status: 'handing-over' });
 
   return {
     type: llmResult.type,
@@ -239,6 +249,11 @@ export async function executeToolCall(
 ): Promise<unknown> {
   const realtime = getRealtimeClient();
   const channel = realtime.channels.get(channelName(sessionId));
+
+  // Enter presence using the per-session client
+  const sessionClient = getSessionRealtimeClient(sessionId);
+  const presenceChannel = sessionClient.channels.get(channelName(sessionId));
+  await presenceChannel.presence.enter({ status: 'processing' });
 
   // Subscribe to control messages for live steering (stop/steer) — same pattern as callLLMStreaming
   const abortController = new AbortController();
@@ -317,7 +332,7 @@ export async function executeToolCall(
     }
   } catch (err) {
     channel.unsubscribe('control', controlHandler);
-    // On cancellation: update the tool message to show 'cancelled', then rethrow
+    // On cancellation: update the tool message to show 'cancelled', leave presence, then rethrow
     // so the workflow's CancellationScope handles agent state rollback.
     if (err instanceof CancelledFailure) {
       if (serial) {
@@ -329,6 +344,7 @@ export async function executeToolCall(
           }),
         });
       }
+      await presenceChannel.presence.leave();
       throw err;
     }
     throw err;
@@ -347,6 +363,9 @@ export async function executeToolCall(
       }),
     });
   }
+
+  // Leave presence with handing-over status — a follow-up LLM call typically follows.
+  await presenceChannel.presence.leave({ status: 'handing-over' });
 
   return toolResult;
 }
@@ -403,18 +422,9 @@ export async function updateEscalationStatus(
 }
 
 /**
- * Enter presence on the session channel to signal that the AI agent is active.
- * The frontend subscribes to presence to show "AI is thinking..." / "Agent disconnected".
- * If the worker crashes, Ably automatically fires a presence leave event.
+ * Clean up the per-session Ably client when the workflow completes.
+ * This closes the connection, which triggers an automatic presence leave.
  */
-export async function enterAgentPresence(sessionId: string): Promise<void> {
-  const realtime = getRealtimeClient();
-  const channel = realtime.channels.get(channelName(sessionId));
-  await channel.presence.enter({ status: 'processing' });
-}
-
-export async function leaveAgentPresence(sessionId: string): Promise<void> {
-  const realtime = getRealtimeClient();
-  const channel = realtime.channels.get(channelName(sessionId));
-  await channel.presence.leave();
+export async function cleanupSessionClient(sessionId: string): Promise<void> {
+  closeSessionClient(sessionId);
 }
