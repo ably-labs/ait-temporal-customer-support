@@ -1,7 +1,42 @@
-import { Context } from '@temporalio/activity';
+import { Context, CancelledFailure } from '@temporalio/activity';
 import { getRealtimeClient, getRestClient, channelName } from './ably-clients';
 import { streamClaude } from './llm';
 import type { Message } from './workflows';
+
+/**
+ * Cancellation-aware sleep that responds to both Temporal cancellation
+ * (CancellationScope.cancel()) and Ably control messages.
+ * Throws CancelledFailure when cancelled, allowing the activity to exit early.
+ */
+function cancellableSleep(ms: number, abortSignal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // Check if already cancelled
+    const cancelSignal = Context.current().cancellationSignal;
+    if (cancelSignal.aborted || abortSignal?.aborted) {
+      reject(new CancelledFailure('Activity cancelled'));
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+
+    const onCancel = () => {
+      clearTimeout(timer);
+      cleanup();
+      reject(new CancelledFailure('Activity cancelled'));
+    };
+
+    const cleanup = () => {
+      cancelSignal.removeEventListener('abort', onCancel);
+      abortSignal?.removeEventListener('abort', onCancel);
+    };
+
+    cancelSignal.addEventListener('abort', onCancel);
+    abortSignal?.addEventListener('abort', onCancel);
+  });
+}
 
 export interface LLMResult {
   type: 'text' | 'tool_use' | 'escalate';
@@ -28,6 +63,8 @@ export interface Activities {
     status: 'responding' | 'resolved' | 'dismissed',
     sessionId: string
   ): Promise<void>;
+  enterAgentPresence(sessionId: string): Promise<void>;
+  leaveAgentPresence(sessionId: string): Promise<void>;
 }
 
 /**
@@ -113,18 +150,51 @@ export async function callLLMStreaming(
     await realtimeChannel.updateMessage({ serial: msgSerial, data: '' });
   }
 
+  // Subscribe to control messages for live steering (stop/steer)
+  // Also connect Temporal's cancellation signal so scope.cancel() aborts the stream.
+  const abortController = new AbortController();
+  const controlHandler = () => {
+    abortController.abort();
+  };
+  const temporalCancelSignal = Context.current().cancellationSignal;
+  const onTemporalCancel = () => abortController.abort();
+  if (temporalCancelSignal.aborted) {
+    abortController.abort();
+  } else {
+    temporalCancelSignal.addEventListener('abort', onTemporalCancel);
+  }
+  await realtimeChannel.subscribe('control', controlHandler);
+
   // Stream Claude response, appending each token to Ably
   const appendPromises: Promise<unknown>[] = [];
   let fullText = '';
 
-  const llmResult = await streamClaude(messages, {
-    onToken: (text) => {
-      fullText += text;
-      // Don't await — pipeline appends for throughput (per Ably docs)
-      appendPromises.push(realtimeChannel.appendMessage({ serial: msgSerial, data: text }));
-    },
-    heartbeat: () => Context.current().heartbeat(),
-  });
+  let llmResult;
+  try {
+    llmResult = await streamClaude(messages, {
+      onToken: (text) => {
+        fullText += text;
+        // Don't await — pipeline appends for throughput (per Ably docs)
+        appendPromises.push(realtimeChannel.appendMessage({ serial: msgSerial, data: text }));
+      },
+      heartbeat: () => Context.current().heartbeat(),
+      abortSignal: abortController.signal,
+    });
+  } finally {
+    realtimeChannel.unsubscribe('control', controlHandler);
+    temporalCancelSignal.removeEventListener('abort', onTemporalCancel);
+  }
+
+  // Check if streaming was aborted (by control message or Temporal cancellation)
+  const aborted = abortController.signal.aborted;
+
+  // NOTE: The cleanup below (settling appends + writing terminal status) runs after
+  // the stream has already stopped but before we rethrow CancelledFailure. If the
+  // worker crashes between here and the throw, the retry will start a fresh Ably
+  // message (attempt 2, idempotent) and re-stream. The old message would be left
+  // without a terminal status header. This is acceptable: presence leave (fired
+  // automatically by Ably on disconnect) clears the frontend's "thinking" state,
+  // and the retry produces a correct replacement message.
 
   // Wait for all appends; fall back to full updateMessage if any failed
   const results = await Promise.allSettled(appendPromises);
@@ -134,11 +204,18 @@ export async function callLLMStreaming(
     await realtimeChannel.updateMessage({ serial: msgSerial, data: fullText });
   }
 
-  // Signal completion — extras-only update, body preserved via shallow mixin semantics
+  // Signal terminal status — 'stopped' if aborted, 'complete' otherwise.
+  // This header is the source of truth for session state (what the user sees).
+  const terminalStatus = aborted ? 'stopped' : 'complete';
   await realtimeChannel.updateMessage({
     serial: msgSerial,
-    extras: { headers: { status: 'complete' } },
+    extras: { headers: { status: terminalStatus } },
   });
+
+  // If aborted by cancellation, rethrow so the workflow's CancellationScope handles it
+  if (aborted) {
+    throw new CancelledFailure('LLM streaming aborted');
+  }
 
   return {
     type: llmResult.type,
@@ -163,6 +240,13 @@ export async function executeToolCall(
   const realtime = getRealtimeClient();
   const channel = realtime.channels.get(channelName(sessionId));
 
+  // Subscribe to control messages for live steering (stop/steer) — same pattern as callLLMStreaming
+  const abortController = new AbortController();
+  const controlHandler = () => {
+    abortController.abort();
+  };
+  await channel.subscribe('control', controlHandler);
+
   // Publish tool call start
   const result = await channel.publish({
     name: 'tool',
@@ -171,30 +255,96 @@ export async function executeToolCall(
   const serial = result.serials[0];
 
   let toolResult: unknown;
-  switch (toolName) {
-    case 'lookupOrder':
-      toolResult = {
-        orderId: toolInput.orderId,
-        status: 'shipped',
-        trackingNumber: 'TRK-12345-MOCK',
-        estimatedDelivery: '2026-03-10',
-      };
-      break;
-    case 'checkRefundStatus':
-      toolResult = { refundId: toolInput.refundId, status: 'processing', estimatedCompletion: '3-5 business days' };
-      break;
-    case 'getAccountDetails':
-      toolResult = { customerId: toolInput.customerId, name: 'Jane Doe', plan: 'Pro', memberSince: '2024-01' };
-      break;
-    default:
-      toolResult = { error: `Unknown tool: ${toolName}` };
+
+  try {
+    switch (toolName) {
+      case 'lookupOrder':
+        toolResult = {
+          orderId: toolInput.orderId,
+          status: 'shipped',
+          trackingNumber: 'TRK-12345-MOCK',
+          estimatedDelivery: '2026-03-10',
+        };
+        break;
+      case 'checkRefundStatus':
+        toolResult = { refundId: toolInput.refundId, status: 'processing', estimatedCompletion: '3-5 business days' };
+        break;
+      case 'getAccountDetails':
+        toolResult = { customerId: toolInput.customerId, name: 'Jane Doe', plan: 'Pro', memberSince: '2024-01' };
+        break;
+      case 'doResearch': {
+        // Long-running mock research — ~20 seconds with progress updates
+        const steps = [
+          { label: 'Searching knowledge base...', durationMs: 4000 },
+          { label: 'Analyzing order history...', durationMs: 4000 },
+          { label: 'Cross-referencing support tickets...', durationMs: 4000 },
+          { label: 'Checking product documentation...', durationMs: 4000 },
+          { label: 'Compiling findings...', durationMs: 4000 },
+        ];
+        const topic = toolInput.topic as string;
+
+        for (let i = 0; i < steps.length; i++) {
+          const step = steps[i];
+          // Update tool message with current progress
+          if (serial) {
+            await channel.updateMessage({
+              serial,
+              data: JSON.stringify({
+                toolName, input: toolInput, status: 'calling',
+                progress: { step: i + 1, total: steps.length, label: step.label },
+              }),
+            });
+          }
+          Context.current().heartbeat(`step ${i + 1}`);
+          // Cancellation-aware sleep — responds to both Temporal cancellation and Ably control messages
+          await cancellableSleep(step.durationMs, abortController.signal);
+        }
+
+        toolResult = {
+          topic,
+          findings: [
+            'Found 3 related support tickets from other customers',
+            'Product documentation confirms this is a known limitation',
+            'Engineering team has a fix scheduled for next release (v2.4)',
+            'Workaround available: clear browser cache and retry',
+          ],
+          recommendation: 'Apply the workaround now, permanent fix coming in v2.4.',
+        };
+        break;
+      }
+      default:
+        toolResult = { error: `Unknown tool: ${toolName}` };
+    }
+  } catch (err) {
+    channel.unsubscribe('control', controlHandler);
+    // On cancellation: update the tool message to show 'cancelled', then rethrow
+    // so the workflow's CancellationScope handles agent state rollback.
+    if (err instanceof CancelledFailure) {
+      if (serial) {
+        await channel.updateMessage({
+          serial,
+          data: JSON.stringify({
+            toolName, input: toolInput,
+            status: 'cancelled',
+          }),
+        });
+      }
+      throw err;
+    }
+    throw err;
   }
+
+  channel.unsubscribe('control', controlHandler);
 
   // Publish tool result — update the same message with result data
   if (serial) {
     await channel.updateMessage({
       serial,
-      data: JSON.stringify({ toolName, input: toolInput, status: 'complete', result: toolResult }),
+      data: JSON.stringify({
+        toolName, input: toolInput,
+        status: 'complete',
+        result: toolResult,
+      }),
     });
   }
 
@@ -250,4 +400,21 @@ export async function updateEscalationStatus(
     serial: escalationSerial,
     data: JSON.stringify({ status, sessionId }),
   });
+}
+
+/**
+ * Enter presence on the session channel to signal that the AI agent is active.
+ * The frontend subscribes to presence to show "AI is thinking..." / "Agent disconnected".
+ * If the worker crashes, Ably automatically fires a presence leave event.
+ */
+export async function enterAgentPresence(sessionId: string): Promise<void> {
+  const realtime = getRealtimeClient();
+  const channel = realtime.channels.get(channelName(sessionId));
+  await channel.presence.enter({ status: 'processing' });
+}
+
+export async function leaveAgentPresence(sessionId: string): Promise<void> {
+  const realtime = getRealtimeClient();
+  const channel = realtime.channels.get(channelName(sessionId));
+  await channel.presence.leave();
 }

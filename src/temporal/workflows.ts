@@ -1,9 +1,13 @@
-import { proxyActivities, setHandler, condition, defineSignal } from '@temporalio/workflow';
+import {
+  proxyActivities, setHandler, condition, defineSignal,
+  CancellationScope, isCancellation,
+} from '@temporalio/workflow';
 import type { Activities } from './activities';
 
 // Signal definitions
 export const userMessage = defineSignal<[string, string]>('userMessage');
 export const humanAgentResponse = defineSignal<[{ action: string; message?: string }]>('humanAgentResponse');
+export const steerGeneration = defineSignal<[{ action: 'stop' | 'newMessage'; text?: string; messageId?: string }]>('steerGeneration');
 
 
 export interface Message {
@@ -30,10 +34,12 @@ export async function supportSessionWorkflow(
 ): Promise<void> {
   const messages: Message[] = [];
   let pendingUserMessage: { text: string; messageId: string } | null = null;
-  // Type-widened to string so TS doesn't incorrectly narrow after signal handler mutations.
-  // Signal handlers (setHandler) mutate status asynchronously, which TS control-flow analysis can't track.
+  // Type-widened so TS doesn't incorrectly narrow after signal handler mutations.
   let status = 'active' as 'active' | 'escalated' | 'resolved';
   let humanDecision: { action: string; message?: string } | null = null;
+  // Live steering: set by steerGeneration signal to cancel the running LLM scope
+  let activeLLMScope: CancellationScope | null = null;
+  let steerAction: { action: 'stop' | 'newMessage'; text?: string; messageId?: string } | null = null;
 
   // Signal handlers
   setHandler(userMessage, (msg: string, messageId: string) => {
@@ -44,6 +50,13 @@ export async function supportSessionWorkflow(
     humanDecision = decision;
   });
 
+  setHandler(steerGeneration, (steer) => {
+    steerAction = steer;
+    // Cancel the running LLM scope if one exists — activity will abort
+    if (activeLLMScope) {
+      activeLLMScope.cancel();
+    }
+  });
 
   let turnIndex = 0;
 
@@ -61,7 +74,6 @@ export async function supportSessionWorkflow(
 
     // If escalated, forward customer messages to the human agent — don't call AI
     if (status === 'escalated') {
-      // Notify the agent dashboard that the customer sent a new message
       await activities.notifyHumanAgent(sessionId, {
         customerName,
         reason: `Customer sent a follow-up message: "${userMsg}"`,
@@ -70,110 +82,169 @@ export async function supportSessionWorkflow(
       continue;
     }
 
-    // Call LLM (streaming tokens to Ably inside the activity)
-    const llmResult = await activities.callLLMStreaming(sessionId, messages, turnIndex);
-    turnIndex++;
+    // Run the AI turn — may be cancelled by steerGeneration signal
+    await runAITurn();
+  }
 
-    messages.push({
-      role: 'assistant',
-      content: llmResult.fullText,
-      rawContentBlocks: llmResult.rawContentBlocks,
+  /**
+   * Run one complete AI turn: LLM call, optional tool use + follow-up.
+   * Wrapped in a CancellationScope so live steering can interrupt it.
+   *
+   * Cancellation strategy: checkpoint-based rollback.
+   * Before calling the LLM, we snapshot `messages.length`. If the scope is
+   * cancelled, we roll back agent state to the checkpoint — no ad-hoc message
+   * inspection needed. Session state (what the user sees in Ably) is handled
+   * independently by the activities: `callLLMStreaming` sends `status: 'stopped'`
+   * and `executeToolCall` sends `status: 'cancelled'` before rethrowing.
+   */
+  async function runAITurn(): Promise<void> {
+    await activities.enterAgentPresence(sessionId);
+
+    // Checkpoint: snapshot agent state before this turn
+    const checkpoint = messages.length;
+
+    const scope = new CancellationScope();
+    activeLLMScope = scope;
+
+    try {
+      await scope.run(async () => {
+        // Call LLM (streaming tokens to Ably inside the activity)
+        const llmResult = await activities.callLLMStreaming(sessionId, messages, turnIndex);
+        turnIndex++;
+
+        messages.push({
+          role: 'assistant',
+          content: llmResult.fullText,
+          rawContentBlocks: llmResult.rawContentBlocks,
+        });
+
+        if (llmResult.type === 'tool_use') {
+          const toolResult = await activities.executeToolCall(
+            sessionId,
+            llmResult.toolName!,
+            llmResult.toolInput!
+          );
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify(toolResult),
+            toolName: llmResult.toolName,
+            toolUseId: llmResult.toolUseId,
+          });
+
+          // Follow-up LLM call with tool results
+          const followUp = await activities.callLLMStreaming(sessionId, messages, turnIndex);
+          turnIndex++;
+          messages.push({ role: 'assistant', content: followUp.fullText });
+        } else if (llmResult.type === 'escalate') {
+          await handleEscalation(llmResult);
+        }
+      });
+    } catch (err) {
+      if (isCancellation(err)) {
+        // Roll back agent state to the checkpoint — clean and deterministic.
+        // Session state (Ably messages) was already finalised by each activity
+        // before rethrowing (status: 'stopped' / 'cancelled').
+        messages.length = checkpoint;
+      } else {
+        throw err;
+      }
+    } finally {
+      activeLLMScope = null;
+    }
+
+    // After cancellation, handle the steer action — then leave presence.
+    // Presence leave must happen AFTER any notifications so the frontend
+    // receives them in order (message first, then presence leave).
+    if (steerAction) {
+      const action = steerAction;
+      steerAction = null;
+
+      if (action.action === 'newMessage' && action.text && action.messageId) {
+        pendingUserMessage = { text: action.text, messageId: action.messageId };
+      } else {
+        // 'stop' — notify the user via escalation notice
+        await CancellationScope.nonCancellable(async () => {
+          await activities.publishEscalation(
+            sessionId,
+            'Generation stopped. Send a new message when you\'re ready.'
+          );
+        });
+      }
+    }
+
+    // Leave presence after all post-cancellation work is done
+    await CancellationScope.nonCancellable(async () => {
+      await activities.leaveAgentPresence(sessionId);
+    });
+  }
+
+  async function handleEscalation(llmResult: {
+    fullText: string;
+    toolName?: string;
+    toolInput?: Record<string, unknown>;
+  }): Promise<void> {
+    status = 'escalated';
+
+    await activities.publishEscalation(
+      sessionId,
+      'You have been connected to our support team. A human agent will be with you shortly.'
+    );
+
+    const escalationSerial = await activities.notifyHumanAgent(sessionId, {
+      customerName,
+      reason: llmResult.toolInput?.reason as string || llmResult.fullText,
+      history: messages,
     });
 
-    if (llmResult.type === 'tool_use') {
-      const toolResult = await activities.executeToolCall(
-        sessionId,
-        llmResult.toolName!,
-        llmResult.toolInput!
-      );
-      messages.push({
-        role: 'tool',
-        content: JSON.stringify(toolResult),
-        toolName: llmResult.toolName,
-        toolUseId: llmResult.toolUseId,
-      });
+    let agentHasJoined = false;
 
-      // Follow-up LLM call with tool results
-      const followUp = await activities.callLLMStreaming(sessionId, messages, turnIndex);
-      turnIndex++;
-      messages.push({ role: 'assistant', content: followUp.fullText });
-    } else if (llmResult.type === 'escalate') {
-      status = 'escalated';
+    while (status === 'escalated') {
+      await condition(() => humanDecision !== null || pendingUserMessage !== null);
 
-      // The activity already replaced the raw [ESCALATE:...] text with a friendly
-      // message before the completion signal, so the customer never sees the raw text.
+      if (humanDecision !== null) {
+        const decision = humanDecision as { action: string; message?: string };
+        humanDecision = null;
 
-      // Publish escalation banner to the session channel
-      await activities.publishEscalation(
-        sessionId,
-        "You have been connected to our support team. A human agent will be with you shortly."
-      );
-
-      // Notify the agent dashboard — returns the message serial for later status updates
-      const escalationSerial = await activities.notifyHumanAgent(sessionId, {
-        customerName,
-        reason: llmResult.fullText,
-        history: messages,
-      });
-
-      // Durable HITL wait — can last hours/days, zero compute
-      // Wait for either a human decision OR a new customer message (to forward)
-      let agentHasJoined = false;
-
-      while (status === 'escalated') {
-        await condition(() => humanDecision !== null || pendingUserMessage !== null);
-
-        // If human agent responded, handle it
-        if (humanDecision !== null) {
-          const decision = humanDecision as { action: string; message?: string };
-          humanDecision = null;
-
-          // First human response — tell the customer the agent is here
-          if (!agentHasJoined) {
-            agentHasJoined = true;
-            await activities.updateEscalationStatus(escalationSerial, 'responding', sessionId);
-            await activities.publishEscalation(
-              sessionId,
-              'A support agent has joined the conversation. You can now communicate with them directly.'
-            );
-          }
-
-          if (decision.message) {
-            // Publish the human agent's message as an agent response (not user)
-            await activities.publishAgentMessage(
-              sessionId,
-              decision.message,
-              `agent_${sessionId}_${turnIndex}`
-            );
-            turnIndex++;
-            messages.push({ role: 'assistant', content: decision.message });
-          }
-
-          if (decision.action === 'resolve') {
-            status = 'resolved';
-            await activities.updateEscalationStatus(escalationSerial, 'resolved', sessionId);
-            // Notify the customer that the session is resolved
-            await activities.publishEscalation(
-              sessionId,
-              'This conversation has been resolved by our support team. Thank you for contacting us!'
-            );
-          } else if (decision.action === 'handback') {
-            status = 'active';
-            await activities.publishEscalation(
-              sessionId,
-              'You have been reconnected to our AI assistant. How can we help you further?'
-            );
-          }
-          // 'respond' keeps status as 'escalated' — human stays in control
+        if (!agentHasJoined) {
+          agentHasJoined = true;
+          await activities.updateEscalationStatus(escalationSerial, 'responding', sessionId);
+          await activities.publishEscalation(
+            sessionId,
+            'A support agent has joined the conversation. You can now communicate with them directly.'
+          );
         }
 
-        // If customer sent a message while escalated, just publish it (already done above)
-        if (pendingUserMessage !== null) {
-          const { text: msg, messageId: msgId } = pendingUserMessage;
-          pendingUserMessage = null;
-          messages.push({ role: 'user', content: msg });
-          await activities.publishUserMessage(sessionId, msg, customerName, msgId);
+        if (decision.message) {
+          await activities.publishAgentMessage(
+            sessionId,
+            decision.message,
+            `agent_${sessionId}_${turnIndex}`
+          );
+          turnIndex++;
+          messages.push({ role: 'assistant', content: decision.message });
         }
+
+        if (decision.action === 'resolve') {
+          status = 'resolved';
+          await activities.updateEscalationStatus(escalationSerial, 'resolved', sessionId);
+          await activities.publishEscalation(
+            sessionId,
+            'This conversation has been resolved by our support team. Thank you for contacting us!'
+          );
+        } else if (decision.action === 'handback') {
+          status = 'active';
+          await activities.publishEscalation(
+            sessionId,
+            'You have been reconnected to our AI assistant. How can we help you further?'
+          );
+        }
+      }
+
+      if (pendingUserMessage !== null) {
+        const { text: msg, messageId: msgId } = pendingUserMessage;
+        pendingUserMessage = null;
+        messages.push({ role: 'user', content: msg });
+        await activities.publishUserMessage(sessionId, msg, customerName, msgId);
       }
     }
   }

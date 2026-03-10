@@ -11,8 +11,8 @@ export default function SessionPage({ params }: { params: Promise<{ id: string }
   const channelName = `ai:support:${sessionId}`;
 
   return (
-    <div className="flex flex-col h-screen">
-      <header className="border-b border-zinc-200 dark:border-zinc-700 px-4 py-3 flex items-center justify-between">
+    <div className="flex flex-col h-screen overflow-hidden">
+      <header className="shrink-0 border-b border-zinc-200 dark:border-zinc-700 px-4 py-3 flex items-center justify-between">
         <div>
           <h1 className="text-lg font-semibold">Support Chat</h1>
           <p className="text-xs text-zinc-400 font-mono">{sessionId}</p>
@@ -24,7 +24,7 @@ export default function SessionPage({ params }: { params: Promise<{ id: string }
           New session
         </Link>
       </header>
-      <AblyProviderWrapper clientId={`customer-${sessionId}`}>
+      <AblyProviderWrapper clientId={`customer-${sessionId}`} className="flex-1 min-h-0 flex flex-col">
         <ChannelProvider channelName={channelName} options={{ params: { rewind: '100' } }}>
           <ChatSession sessionId={sessionId} />
         </ChannelProvider>

@@ -7,9 +7,10 @@ import { AblyProvider } from 'ably/react';
 interface Props {
   clientId: string;
   children: ReactNode;
+  className?: string;
 }
 
-export default function AblyProviderWrapper({ clientId, children }: Props) {
+export default function AblyProviderWrapper({ clientId, children, className }: Props) {
   // Defer Ably client creation to the browser — Realtime connects immediately
   // on construction, and relative fetch URLs don't work during SSR.
   const [client, setClient] = useState<Ably.Realtime | null>(null);
@@ -38,5 +39,9 @@ export default function AblyProviderWrapper({ clientId, children }: Props) {
 
   if (!client) return null;
 
-  return <AblyProvider client={client}>{children}</AblyProvider>;
+  return (
+    <AblyProvider client={client}>
+      {className ? <div className={className}>{children}</div> : children}
+    </AblyProvider>
+  );
 }

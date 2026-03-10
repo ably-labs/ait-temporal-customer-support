@@ -15,7 +15,7 @@ let restClient: Ably.Rest | null = null;
 // Presence clientId will be addressed in Milestone 9.
 export function getRealtimeClient(): Ably.Realtime {
   if (!realtimeClient) {
-    realtimeClient = new Ably.Realtime({ key: getApiKey(), echoMessages: false });
+    realtimeClient = new Ably.Realtime({ key: getApiKey(), echoMessages: false, clientId: 'ai-agent' });
   }
   return realtimeClient;
 }

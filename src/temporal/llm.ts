@@ -18,8 +18,11 @@ You can help customers with:
 - Order tracking and delivery status
 - Refund inquiries
 - Account information
+- Researching issues and investigating problems
 
 Be concise, friendly, and professional. When you need to look up information, use the available tools.
+
+If a customer asks you to research something, investigate an issue, or asks a general "why" question about delays/problems/issues, use the doResearch tool immediately — do not ask for more details first. The research tool will check multiple sources on their behalf.
 
 If a customer has a billing dispute, complex complaint, or requests to speak with a human, use the escalateToHuman tool. Do not try to handle these situations yourself.
 
@@ -70,11 +73,23 @@ export const TOOLS: Anthropic.Tool[] = [
       required: ['reason'],
     },
   },
+  {
+    name: 'doResearch',
+    description: 'Perform in-depth research on a topic. This is a long-running operation that checks multiple sources. Use this when the customer asks you to research something, investigate an issue thoroughly, or compare options.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        topic: { type: 'string', description: 'The research topic or question to investigate' },
+      },
+      required: ['topic'],
+    },
+  },
 ];
 
 export interface StreamCallbacks {
   onToken: (text: string) => void;
   heartbeat: () => void;
+  abortSignal?: AbortSignal;
 }
 
 export interface LLMStreamResult {
@@ -143,7 +158,16 @@ export async function streamClaude(
   let toolUseId: string | undefined;
   let hasToolUse = false;
 
+  let aborted = false;
+
   for await (const event of stream) {
+    // Check abort signal — stop consuming tokens if steering/stop received
+    if (callbacks.abortSignal?.aborted) {
+      aborted = true;
+      stream.abort();
+      break;
+    }
+
     callbacks.heartbeat();
 
     if (event.type === 'content_block_start') {
@@ -161,6 +185,10 @@ export async function streamClaude(
         toolInputJson += event.delta.partial_json;
       }
     }
+  }
+
+  if (aborted) {
+    return { type: 'text', fullText };
   }
 
   // Parse tool input if we got a tool use

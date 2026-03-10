@@ -47,8 +47,8 @@ export class MessageAccumulator {
 
     const data = typeof message.data === 'string' ? message.data : '';
     const action = message.action ?? 'message.create';
-    const isComplete =
-      (message.extras?.headers as Record<string, string>)?.status === 'complete';
+    const headerStatus = (message.extras?.headers as Record<string, string>)?.status;
+    const isComplete = headerStatus === 'complete' || headerStatus === 'stopped';
 
     let accumulated: AccumulatedMessage;
 

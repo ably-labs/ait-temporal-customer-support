@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useChannel } from 'ably/react';
+import { useChannel, usePresenceListener } from 'ably/react';
 import type Ably from 'ably';
 import { MessageAccumulator } from '@/lib/message-accumulator';
 
@@ -12,7 +12,7 @@ interface ChatMessage {
   content: string;
   isStreaming: boolean;
   source?: 'human-agent'; // set when a human agent sends the message
-  toolData?: { toolName: string; input: Record<string, unknown>; status: string; result?: unknown };
+  toolData?: { toolName: string; input: Record<string, unknown>; status: string; result?: unknown; progress?: { step: number; total: number; label: string } };
 }
 
 interface Props {
@@ -25,6 +25,28 @@ export default function ChatSession({ sessionId }: Props) {
   const [sending, setSending] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const channelName = `ai:support:${sessionId}`;
+  const [agentPresent, setAgentPresent] = useState(false);
+  const [agentDisconnected, setAgentDisconnected] = useState(false);
+
+  // Track agent presence — shows "AI is thinking..." and detects crashes
+  const { presenceData } = usePresenceListener(channelName);
+  useEffect(() => {
+    const wasPresent = agentPresent;
+    const isPresent = presenceData.length > 0;
+    setAgentPresent(isPresent);
+    // Agent was present and left — could be normal completion or crash
+    // Only show "disconnected" if we had seen the agent and it left unexpectedly
+    if (wasPresent && !isPresent) {
+      // Check if there's an active streaming message — if so, agent crashed mid-stream
+      const hasActiveStream = messages.some((m) => m.isStreaming);
+      if (hasActiveStream) {
+        setAgentDisconnected(true);
+      }
+    }
+    if (isPresent && agentDisconnected) {
+      setAgentDisconnected(false);
+    }
+  }, [presenceData, agentPresent, agentDisconnected, messages]);
 
   // Accumulator handles message materialisation — one instance for the component lifetime
   const [accumulator] = useState(() => new MessageAccumulator());
@@ -61,9 +83,16 @@ export default function ChatSession({ sessionId }: Props) {
       }
 
       if (name === 'response') {
-        const source = (result.extras?.headers as Record<string, string>)?.source === 'human-agent'
+        const headers = result.extras?.headers as Record<string, string> | undefined;
+        const source = headers?.source === 'human-agent'
           ? 'human-agent' as const
           : undefined;
+        // Detect intentional stop via the status header — source of truth for session state.
+        // When status is 'stopped', clear agentDisconnected (this is not a crash).
+        const isStopped = headers?.status === 'stopped';
+        if (isStopped) {
+          setAgentDisconnected(false);
+        }
         setMessages((prev) => {
           const existing = prev.find((m) => m.id === serial);
           if (existing) {
@@ -168,15 +197,68 @@ export default function ChatSession({ sessionId }: Props) {
     }
   };
 
+  const isStreaming = messages.some((m) => m.isStreaming);
+  // Agent is working if streaming OR present (covers tool execution like doResearch)
+  const isAgentWorking = isStreaming || agentPresent;
+
+  const stopGeneration = async () => {
+    try {
+      await fetch(`/api/sessions/${sessionId}/steer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'stop' }),
+      });
+    } catch (err) {
+      console.error('Failed to stop:', err);
+    }
+  };
+
+  const sendMessageWhileStreaming = async (text: string) => {
+    const messageId = `user_${sessionId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    // Optimistic UI
+    setMessages((prev) => [
+      ...prev,
+      { id: messageId, type: 'text', role: 'user', content: text, isStreaming: false },
+    ]);
+    setInput('');
+
+    try {
+      await fetch(`/api/sessions/${sessionId}/steer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'newMessage', text, messageId }),
+      });
+    } catch (err) {
+      console.error('Failed to steer:', err);
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      sendMessage();
+      if (isAgentWorking && input.trim()) {
+        sendMessageWhileStreaming(input.trim());
+      } else {
+        sendMessage();
+      }
     }
   };
 
   return (
     <div className="flex flex-col h-full">
+      {/* Agent status bar */}
+      {agentDisconnected && (
+        <div className="bg-red-50 dark:bg-red-900/20 border-b border-red-200 dark:border-red-800 px-4 py-2 text-sm text-red-700 dark:text-red-300 flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full bg-red-500" />
+          Agent disconnected — reconnecting...
+        </div>
+      )}
+      {agentPresent && !agentDisconnected && (
+        <div className="bg-blue-50 dark:bg-blue-900/20 border-b border-blue-200 dark:border-blue-800 px-4 py-2 text-sm text-blue-700 dark:text-blue-300 flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
+          AI is thinking...
+        </div>
+      )}
       {/* Message list */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.length === 0 && (
@@ -194,10 +276,17 @@ export default function ChatSession({ sessionId }: Props) {
                   <div className="flex items-center gap-2 text-zinc-500 text-xs font-medium mb-1.5">
                     <span className="font-mono">{tool?.toolName}</span>
                     {tool?.status === 'calling' && (
-                      <span className="animate-pulse">running...</span>
+                      <span className="animate-pulse">
+                        {tool.progress
+                          ? `${tool.progress.label} (${tool.progress.step}/${tool.progress.total})`
+                          : 'running...'}
+                      </span>
                     )}
                     {tool?.status === 'complete' && (
                       <span className="text-green-600 dark:text-green-400">done</span>
+                    )}
+                    {tool?.status === 'cancelled' && (
+                      <span className="text-amber-600 dark:text-amber-400">interrupted</span>
                     )}
                   </div>
                   {tool?.status === 'complete' && tool.result != null && (
@@ -284,17 +373,34 @@ export default function ChatSession({ sessionId }: Props) {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder="Type a message..."
-                className="flex-1 rounded-lg border border-zinc-300 dark:border-zinc-600 bg-transparent px-4 py-2.5 text-sm outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                placeholder={isAgentWorking ? 'Type to interrupt or redirect...' : 'Type a message...'}
+                className={`flex-1 rounded-lg border bg-transparent px-4 py-2.5 text-sm outline-none focus:ring-2 focus:border-transparent transition-colors ${
+                  isAgentWorking
+                    ? 'border-amber-300 dark:border-amber-600 focus:ring-amber-500'
+                    : 'border-zinc-300 dark:border-zinc-600 focus:ring-blue-500'
+                }`}
                 disabled={sending}
               />
-              <button
-                onClick={sendMessage}
-                disabled={sending || !input.trim()}
-                className="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-              >
-                Send
-              </button>
+              {isAgentWorking ? (
+                <button
+                  onClick={input.trim() ? () => sendMessageWhileStreaming(input.trim()) : stopGeneration}
+                  className={`rounded-lg px-5 py-2.5 text-sm font-medium transition-colors ${
+                    input.trim()
+                      ? 'bg-amber-600 text-white hover:bg-amber-700'
+                      : 'bg-red-600 text-white hover:bg-red-700'
+                  }`}
+                >
+                  {input.trim() ? 'Send' : 'Stop'}
+                </button>
+              ) : (
+                <button
+                  onClick={sendMessage}
+                  disabled={sending || !input.trim()}
+                  className="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  Send
+                </button>
+              )}
             </div>
           </div>
         );
