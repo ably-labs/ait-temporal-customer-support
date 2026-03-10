@@ -173,12 +173,14 @@ function SessionConversation({ sessionId }: { sessionId: string }) {
   );
 }
 
+// Max sessions to auto-attach Ably channels for — keeps channel count bounded.
+// Older sessions show a manual "Show conversation" toggle instead.
+const MAX_AUTO_ATTACH = 20;
+
 function EscalationList() {
   const [escalations, setEscalations] = useState<Escalation[]>([]);
-  const [expandedSession, setExpandedSession] = useState<string | null>(null);
-  // Track sessions that have ever been expanded — keep their ChannelProvider mounted
-  // to avoid re-attach issues with rewind on remount.
-  const [mountedSessions, setMountedSessions] = useState<Set<string>>(new Set());
+  // Sessions manually expanded by the agent (for those beyond the auto-attach limit)
+  const [manuallyExpanded, setManuallyExpanded] = useState<Set<string>>(new Set());
   const [responseText, setResponseText] = useState<Record<string, string>>({});
   const [sending, setSending] = useState<Record<string, boolean>>({});
 
@@ -289,8 +291,12 @@ function EscalationList() {
         </div>
       )}
 
-      {escalations.filter((e) => e.status !== 'dismissed' && e.status !== 'resolved').map((esc) => {
-        const isExpanded = expandedSession === esc.sessionId;
+      {escalations.filter((e) => e.status !== 'dismissed' && e.status !== 'resolved').map((esc, index) => {
+        // Auto-attach conversation channels for the most recent N sessions.
+        // Older sessions require manual expand to avoid hitting Ably channel limits.
+        const autoAttach = index < MAX_AUTO_ATTACH;
+        const showConversation = autoAttach || manuallyExpanded.has(esc.sessionId);
+
         return (
           <div
             key={esc.id}
@@ -319,16 +325,21 @@ function EscalationList() {
                 <p className="text-xs text-zinc-400 font-mono mt-0.5">{esc.sessionId}</p>
               </div>
               <div className="flex items-center gap-3">
-                <button
-                  onClick={() => {
-                    const next = isExpanded ? null : esc.sessionId;
-                    setExpandedSession(next);
-                    if (next) setMountedSessions((prev) => new Set(prev).add(next));
-                  }}
-                  className="text-xs text-blue-600 hover:text-blue-700 dark:text-blue-400"
-                >
-                  {isExpanded ? 'Hide conversation' : 'Show conversation'}
-                </button>
+                {!autoAttach && (
+                  <button
+                    onClick={() =>
+                      setManuallyExpanded((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(esc.sessionId)) next.delete(esc.sessionId);
+                        else next.add(esc.sessionId);
+                        return next;
+                      })
+                    }
+                    className="text-xs text-blue-600 hover:text-blue-700 dark:text-blue-400"
+                  >
+                    {showConversation ? 'Hide conversation' : 'Show conversation'}
+                  </button>
+                )}
                 <span className="text-xs text-zinc-400">
                   {esc.messageCount} messages
                 </span>
@@ -346,16 +357,13 @@ function EscalationList() {
               {esc.reason}
             </p>
 
-            {/* Inline conversation view — keep mounted once expanded to avoid
-                ChannelProvider re-attach issues with rewind on remount */}
-            {mountedSessions.has(esc.sessionId) && (
+            {/* Inline conversation — auto-attached for recent sessions, manual toggle for older ones */}
+            {showConversation && (
               <ChannelProvider
                 channelName={`ai:support:${esc.sessionId}`}
                 options={{ params: { rewind: '100' } }}
               >
-                <div style={{ display: isExpanded ? 'block' : 'none' }}>
-                  <SessionConversation sessionId={esc.sessionId} />
-                </div>
+                <SessionConversation sessionId={esc.sessionId} />
               </ChannelProvider>
             )}
 

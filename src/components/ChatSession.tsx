@@ -25,28 +25,23 @@ export default function ChatSession({ sessionId }: Props) {
   const [sending, setSending] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const channelName = `ai:support:${sessionId}`;
-  const [agentPresent, setAgentPresent] = useState(false);
-  const [agentDisconnected, setAgentDisconnected] = useState(false);
 
-  // Track agent presence — shows "AI is thinking..." and detects crashes
+  // Track agent presence — purely "is the agent here right now?"
   const { presenceData } = usePresenceListener(channelName);
-  useEffect(() => {
-    const wasPresent = agentPresent;
-    const isPresent = presenceData.length > 0;
-    setAgentPresent(isPresent);
-    // Agent was present and left — could be normal completion or crash
-    // Only show "disconnected" if we had seen the agent and it left unexpectedly
-    if (wasPresent && !isPresent) {
-      // Check if there's an active streaming message — if so, agent crashed mid-stream
-      const hasActiveStream = messages.some((m) => m.isStreaming);
-      if (hasActiveStream) {
-        setAgentDisconnected(true);
-      }
-    }
-    if (isPresent && agentDisconnected) {
-      setAgentDisconnected(false);
-    }
-  }, [presenceData, agentPresent, agentDisconnected, messages]);
+  const agentPresent = presenceData.length > 0;
+
+  // Crash detection state machine — derived from message status + presence.
+  // The last agent message's terminal status is the source of truth:
+  //   - Has terminal status ('complete'/'stopped') → done
+  //   - No terminal status + agent present         → working
+  //   - No terminal status + agent absent          → crashed
+  // This works on reload (rewind delivers messages with their status headers)
+  // and live (no race between presence and message events).
+  const lastAgentMessage = [...messages].reverse().find(
+    (m) => m.type === 'text' && m.role === 'assistant'
+  );
+  const hasUnterminated = lastAgentMessage?.isStreaming === true;
+  const agentCrashed = hasUnterminated && !agentPresent;
 
   // Accumulator handles message materialisation — one instance for the component lifetime
   const [accumulator] = useState(() => new MessageAccumulator());
@@ -87,12 +82,6 @@ export default function ChatSession({ sessionId }: Props) {
         const source = headers?.source === 'human-agent'
           ? 'human-agent' as const
           : undefined;
-        // Detect intentional stop via the status header — source of truth for session state.
-        // When status is 'stopped', clear agentDisconnected (this is not a crash).
-        const isStopped = headers?.status === 'stopped';
-        if (isStopped) {
-          setAgentDisconnected(false);
-        }
         setMessages((prev) => {
           const existing = prev.find((m) => m.id === serial);
           if (existing) {
@@ -247,13 +236,13 @@ export default function ChatSession({ sessionId }: Props) {
   return (
     <div className="flex flex-col h-full">
       {/* Agent status bar */}
-      {agentDisconnected && (
+      {agentCrashed && (
         <div className="bg-red-50 dark:bg-red-900/20 border-b border-red-200 dark:border-red-800 px-4 py-2 text-sm text-red-700 dark:text-red-300 flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-red-500" />
-          Agent disconnected — reconnecting...
+          Agent disconnected
         </div>
       )}
-      {agentPresent && !agentDisconnected && (
+      {agentPresent && !agentCrashed && (
         <div className="bg-blue-50 dark:bg-blue-900/20 border-b border-blue-200 dark:border-blue-800 px-4 py-2 text-sm text-blue-700 dark:text-blue-300 flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
           AI is thinking...

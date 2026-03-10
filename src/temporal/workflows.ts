@@ -172,10 +172,13 @@ export async function supportSessionWorkflow(
       }
     }
 
-    // Leave presence after all post-cancellation work is done
-    await CancellationScope.nonCancellable(async () => {
-      await activities.leaveAgentPresence(sessionId);
-    });
+    // Leave presence after all post-cancellation work is done.
+    // Skip if handleEscalation already left presence before its wait loop.
+    if (status !== 'escalated' && status !== 'resolved') {
+      await CancellationScope.nonCancellable(async () => {
+        await activities.leaveAgentPresence(sessionId);
+      });
+    }
   }
 
   async function handleEscalation(llmResult: {
@@ -195,6 +198,11 @@ export async function supportSessionWorkflow(
       reason: llmResult.toolInput?.reason as string || llmResult.fullText,
       history: messages,
     });
+
+    // Leave AI presence before entering the escalation wait loop.
+    // The AI is no longer actively working — a human agent will take over.
+    // Without this, the customer sees "AI is thinking..." during the entire escalation.
+    await activities.leaveAgentPresence(sessionId);
 
     let agentHasJoined = false;
 
