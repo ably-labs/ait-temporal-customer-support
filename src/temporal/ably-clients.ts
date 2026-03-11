@@ -15,6 +15,8 @@ let restClient: Ably.Rest | null = null;
 // messages are identified by name ('response').
 export function getRealtimeClient(): Ably.Realtime {
   if (!realtimeClient) {
+    // Prevents the agent from receiving its own messages. Future AI Transport SDK
+    // versions may handle this automatically for agent connections.
     realtimeClient = new Ably.Realtime({ key: getApiKey(), echoMessages: false });
   }
   return realtimeClient;
@@ -57,6 +59,8 @@ export function getSessionRealtimeClient(sessionId: string): Ably.Realtime {
   if (!client) {
     client = new Ably.Realtime({
       key: getApiKey(),
+      // Prevents the agent from receiving its own messages. Future AI Transport SDK
+      // versions may handle this automatically for agent connections.
       echoMessages: false,
       clientId: `ai-agent:${sessionId}`,
     });
