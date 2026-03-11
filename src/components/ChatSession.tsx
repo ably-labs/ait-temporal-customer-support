@@ -5,6 +5,7 @@ import { useChannel } from 'ably/react';
 import type Ably from 'ably';
 import { MessageAccumulator } from '@/lib/message-accumulator';
 import { useAgentPresence } from '@/hooks/useAgentPresence';
+import { useHumanAgentPresence } from '@/hooks/useHumanAgentPresence';
 
 interface ChatMessage {
   id: string; // serial for confirmed messages, messageId for pending
@@ -13,6 +14,7 @@ interface ChatMessage {
   content: string;
   isStreaming: boolean;
   source?: 'human-agent'; // set when a human agent sends the message
+  escalationType?: 'escalated' | 'resolved'; // from extras.headers['x-escalation-type']
   toolData?: { toolName: string; input: Record<string, unknown>; status: string; result?: unknown; progress?: { step: number; total: number; label: string } };
 }
 
@@ -27,8 +29,10 @@ export default function ChatSession({ sessionId }: Props) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const channelName = `ai:support:${sessionId}`;
 
-  // Track agent presence with handover-aware logic (extracted to reusable hook)
-  const { agentPresent } = useAgentPresence(channelName);
+  // Track AI agent presence with handover-aware logic (extracted to reusable hook)
+  const { agentStatus, agentWorking: agentPresent, clearHandover } = useAgentPresence(channelName);
+  // Track human support agent presence (simple: present or not)
+  const { humanAgentPresent } = useHumanAgentPresence(channelName);
 
   // Crash detection state machine — derived from message status + presence.
   // The last agent message's terminal status is the source of truth:
@@ -39,7 +43,45 @@ export default function ChatSession({ sessionId }: Props) {
     (m) => m.type === 'text' && m.role === 'assistant'
   );
   const hasUnterminated = lastAgentMessage?.isStreaming === true;
-  const agentCrashed = hasUnterminated && !agentPresent;
+  const agentCrashed = hasUnterminated && agentStatus === 'absent';
+
+  // Show an in-chat notice when a human agent joins or leaves (presence-driven).
+  // These messages are ephemeral — they live in React state only and are lost on
+  // page reload. For a demo this is acceptable; a production app would persist
+  // them as Ably messages or reconstruct from presence history.
+  // Uses a ref to track previous state and avoid duplicate messages on mount.
+  const prevHumanPresent = useRef<boolean | null>(null);
+  useEffect(() => {
+    // Skip the initial render — only react to changes
+    if (prevHumanPresent.current === null) {
+      prevHumanPresent.current = humanAgentPresent;
+      return;
+    }
+    if (humanAgentPresent && !prevHumanPresent.current) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `presence-join-${Date.now()}`,
+          type: 'escalation',
+          role: 'system',
+          content: 'A support agent has joined the conversation.',
+          isStreaming: false,
+        },
+      ]);
+    } else if (!humanAgentPresent && prevHumanPresent.current) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `presence-leave-${Date.now()}`,
+          type: 'escalation',
+          role: 'system',
+          content: 'The support agent has left the conversation.',
+          isStreaming: false,
+        },
+      ]);
+    }
+    prevHumanPresent.current = humanAgentPresent;
+  }, [humanAgentPresent]);
 
   // Accumulator handles message materialisation — one instance for the component lifetime
   const [accumulator] = useState(() => new MessageAccumulator());
@@ -76,6 +118,20 @@ export default function ChatSession({ sessionId }: Props) {
       }
 
       if (name === 'response') {
+        // When a response message completes, the `next` header tells us whether
+        // the agent's turn is over or more steps follow:
+        //   'text'      → turn is done, clear handover immediately
+        //   'tool_use'  → tool call follows, don't clear (presence handover bridges the gap)
+        //   'escalate'  → escalation follows, don't clear (escalation handler will clear)
+        //   absent      → stopped/aborted, clear immediately
+        if (result.isComplete) {
+          const completionHeaders = result.extras?.headers as Record<string, string> | undefined;
+          const next = completionHeaders?.next;
+          if (!next || next === 'text') {
+            clearHandover();
+          }
+          // 'tool_use' or 'escalate' → leave handover active, next step will handle it
+        }
         const headers = result.extras?.headers as Record<string, string> | undefined;
         const source = headers?.source === 'human-agent'
           ? 'human-agent' as const
@@ -111,6 +167,13 @@ export default function ChatSession({ sessionId }: Props) {
         } catch {
           return;
         }
+        // A cancelled tool means the agent's turn was interrupted — clear handover
+        // so the "AI is thinking" indicator disappears. Without this, the client
+        // waits for the 10s handover timeout because the preceding response message
+        // had `next: 'tool_use'` (which deliberately skipped clearHandover).
+        if (toolData?.status === 'cancelled') {
+          clearHandover();
+        }
         setMessages((prev) => {
           const existing = prev.find((m) => m.id === serial);
           if (existing) {
@@ -127,17 +190,23 @@ export default function ChatSession({ sessionId }: Props) {
       }
 
       if (name === 'escalation') {
+        // Clear handover so the "AI is thinking" indicator disappears immediately.
+        // This is the fallback for cases where no response message with a `next`
+        // header follows (e.g., escalation after tool execution, stop during tool).
+        clearHandover();
+        const escalationHeaders = result.extras?.headers as Record<string, string> | undefined;
+        const escalationType = escalationHeaders?.['x-escalation-type'] as 'escalated' | 'resolved' | undefined;
         setMessages((prev) => {
           const existing = prev.find((m) => m.id === serial);
           if (existing) return prev;
           return [
             ...prev,
-            { id: serial, type: 'escalation', role: 'system', content: result.data, isStreaming: false },
+            { id: serial, type: 'escalation', role: 'system', content: result.data, isStreaming: false, escalationType },
           ];
         });
       }
     },
-    [accumulator]
+    [accumulator, clearHandover]
   );
 
   // Subscribe to the Ably channel (rewind configured via ChannelProvider)
@@ -188,6 +257,10 @@ export default function ChatSession({ sessionId }: Props) {
   // Agent is working if streaming OR present (covers tool execution like doResearch)
   const isAgentWorking = isStreaming || agentPresent;
 
+  // Escalation state — derived from escalation messages
+  const isEscalated = messages.some((m) => m.escalationType === 'escalated')
+    && !messages.some((m) => m.escalationType === 'resolved');
+
   const stopGeneration = async () => {
     try {
       await fetch(`/api/sessions/${sessionId}/steer`, {
@@ -233,17 +306,29 @@ export default function ChatSession({ sessionId }: Props) {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Agent status bar */}
+      {/* Agent status bar — priority: crashed > human agent > AI thinking > waiting for agent */}
       {agentCrashed && (
         <div className="bg-red-50 dark:bg-red-900/20 border-b border-red-200 dark:border-red-800 px-4 py-2 text-sm text-red-700 dark:text-red-300 flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-red-500" />
           Agent disconnected
         </div>
       )}
-      {agentPresent && !agentCrashed && (
+      {!agentCrashed && humanAgentPresent && (
+        <div className="bg-green-50 dark:bg-green-900/20 border-b border-green-200 dark:border-green-800 px-4 py-2 text-sm text-green-700 dark:text-green-300 flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full bg-green-500" />
+          Support agent is online
+        </div>
+      )}
+      {!agentCrashed && !humanAgentPresent && agentPresent && (
         <div className="bg-blue-50 dark:bg-blue-900/20 border-b border-blue-200 dark:border-blue-800 px-4 py-2 text-sm text-blue-700 dark:text-blue-300 flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
           AI is thinking...
+        </div>
+      )}
+      {!agentCrashed && !humanAgentPresent && !agentPresent && isEscalated && (
+        <div className="bg-amber-50 dark:bg-amber-900/20 border-b border-amber-200 dark:border-amber-800 px-4 py-2 text-sm text-amber-700 dark:text-amber-300 flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full bg-amber-400" />
+          Waiting for a support agent...
         </div>
       )}
       {/* Message list */}
@@ -288,7 +373,7 @@ export default function ChatSession({ sessionId }: Props) {
 
           // System notice (escalation, agent joined, resolved, etc.)
           if (msg.type === 'escalation') {
-            const isResolution = msg.content.toLowerCase().includes('resolved');
+            const isResolution = msg.escalationType === 'resolved';
             return (
               <div key={msg.id} className="flex justify-center">
                 <div className={`rounded-lg px-4 py-2.5 text-sm max-w-[85%] text-center ${
@@ -348,7 +433,7 @@ export default function ChatSession({ sessionId }: Props) {
       {/* Input area */}
       {(() => {
         const isResolved = messages.some(
-          (m) => m.type === 'escalation' && m.content.toLowerCase().includes('resolved')
+          (m) => m.type === 'escalation' && m.escalationType === 'resolved'
         );
         if (isResolved) {
           return (
