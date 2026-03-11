@@ -1,5 +1,5 @@
 import { Context, CancelledFailure } from '@temporalio/activity';
-import { getRealtimeClient, getRestClient, createSessionRealtimeClient, channelName } from './ably-clients';
+import { getRealtimeClient, getRestClient, createSessionRealtimeClient, closeAfterHandover, channelName } from './ably-clients';
 import { streamClaude } from './llm';
 import type { Message } from './workflows';
 
@@ -53,7 +53,7 @@ export interface Activities {
   publishAgentMessage(sessionId: string, message: string, messageId: string): Promise<void>;
   callLLMStreaming(sessionId: string, messages: Message[], turnIndex: number): Promise<LLMResult>;
   executeToolCall(sessionId: string, toolName: string, toolInput: Record<string, unknown>): Promise<unknown>;
-  publishEscalation(sessionId: string, reason: string): Promise<void>;
+  publishEscalation(sessionId: string, reason: string, type?: 'escalated' | 'resolved'): Promise<void>;
   notifyHumanAgent(
     sessionId: string,
     context: { customerName: string; reason: string; history: Message[] }
@@ -132,6 +132,8 @@ export async function callLLMStreaming(
   // Enter presence using a per-activity session client so the frontend sees the agent as active.
   const sessionClient = createSessionRealtimeClient(sessionId);
   const presenceChannel = sessionClient.channels.get(channelName(sessionId));
+
+  let handedOver = false;
 
   try {
     await presenceChannel.presence.enter({ status: 'processing' });
@@ -214,11 +216,13 @@ export async function callLLMStreaming(
     }
 
     // Signal terminal status — 'stopped' if aborted, 'complete' otherwise.
-    // This header is the source of truth for session state (what the user sees).
+    // Include the LLM result type so the client knows whether more steps follow:
+    //   'tool_use' or 'escalate' → agent continues working (tool call or escalation next)
+    //   'text' → agent's turn is done, client can clear presence immediately
     const terminalStatus = aborted ? 'stopped' : 'complete';
     await realtimeChannel.updateMessage({
       serial: msgSerial,
-      extras: { headers: { status: terminalStatus } },
+      extras: { headers: { status: terminalStatus, next: llmResult.type } },
     });
 
     // If aborted by cancellation, leave presence and rethrow
@@ -230,6 +234,14 @@ export async function callLLMStreaming(
     // Leave presence with handing-over status — more steps may follow (tool calls, follow-up LLM).
     // The client determines terminal state from the message completion signal.
     await presenceChannel.presence.leave({ status: 'handing-over' });
+    handedOver = true;
+
+    // Keep the connection alive until the next activity enters presence (or 15s
+    // timeout). This prevents the bare leave from sessionClient.close() from
+    // arriving at the frontend before the next activity has entered.
+    // Fire-and-forget: the activity result can return immediately while the
+    // connection lingers in the background.
+    closeAfterHandover(sessionClient, channelName(sessionId));
 
     return {
       type: llmResult.type,
@@ -241,7 +253,11 @@ export async function callLLMStreaming(
       msgSerial,
     };
   } finally {
-    sessionClient.close();
+    // closeAfterHandover owns the connection in the handing-over path.
+    // For error/cancellation paths, close immediately.
+    if (!handedOver) {
+      sessionClient.close();
+    }
   }
 }
 
@@ -264,6 +280,8 @@ export async function executeToolCall(
   // Enter presence using a per-activity session client
   const sessionClient = createSessionRealtimeClient(sessionId);
   const presenceChannel = sessionClient.channels.get(channelName(sessionId));
+
+  let handedOver = false;
 
   try {
     await presenceChannel.presence.enter({ status: 'processing' });
@@ -379,23 +397,38 @@ export async function executeToolCall(
 
     // Leave presence with handing-over status — a follow-up LLM call typically follows.
     await presenceChannel.presence.leave({ status: 'handing-over' });
+    handedOver = true;
+
+    // Keep connection alive until next activity enters (see callLLMStreaming for details)
+    closeAfterHandover(sessionClient, channelName(sessionId));
 
     return toolResult;
   } finally {
-    sessionClient.close();
+    if (!handedOver) {
+      sessionClient.close();
+    }
   }
 }
 
 /**
- * Publish an escalation notice to the session channel so the customer sees it.
+ * Publish a system escalation notice to the session channel.
+ * These appear as centered amber/green notices in the chat UI.
+ *
+ * The escalation type ('escalated' or 'resolved') is carried in message extras
+ * so clients can detect state transitions without fragile string matching.
  */
 export async function publishEscalation(
   sessionId: string,
-  reason: string
+  reason: string,
+  type: 'escalated' | 'resolved' = 'escalated'
 ): Promise<void> {
   const rest = getRestClient();
   const channel = rest.channels.get(channelName(sessionId));
-  await channel.publish({ name: 'escalation', data: reason });
+  await channel.publish({
+    name: 'escalation',
+    data: reason,
+    extras: { headers: { 'x-escalation-type': type } },
+  });
 }
 
 export async function notifyHumanAgent(

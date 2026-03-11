@@ -60,3 +60,48 @@ export function createSessionRealtimeClient(sessionId: string): Ably.Realtime {
 export function channelName(sessionId: string): string {
   return `ai:support:${sessionId}`;
 }
+
+/**
+ * Close a per-activity session client safely during a presence handover.
+ *
+ * After an activity calls `presence.leave({ status: 'handing-over' })`, the
+ * next activity will create a new session client and enter presence. If we
+ * close immediately, the connection drop fires a bare presence leave that
+ * arrives at the frontend *before* the next activity has entered — causing a
+ * brief "agent disconnected" flicker.
+ *
+ * This helper keeps the connection alive until one of:
+ *   a) A new presence enter is detected for an ai-agent:* member → close immediately
+ *   b) The timeout (default 15s) elapses → close anyway
+ *
+ * By waiting, the bare leave from close() either never matters (case a: the
+ * new activity is already present) or happens well after the frontend's own
+ * handover timeout has handled the gap (case b).
+ */
+export async function closeAfterHandover(
+  sessionClient: Ably.Realtime,
+  channel: string,
+  timeoutMs = 15_000,
+): Promise<void> {
+  const presenceChannel = sessionClient.channels.get(channel);
+
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      presenceChannel.presence.unsubscribe(onPresenceEvent);
+      resolve();
+    }, timeoutMs);
+
+    const onPresenceEvent = (member: Ably.PresenceMessage) => {
+      // A new activity entered presence — handover succeeded, safe to close
+      if (member.action === 'enter' && member.clientId?.startsWith('ai-agent:')) {
+        clearTimeout(timer);
+        presenceChannel.presence.unsubscribe(onPresenceEvent);
+        resolve();
+      }
+    };
+
+    presenceChannel.presence.subscribe(onPresenceEvent);
+  });
+
+  sessionClient.close();
+}

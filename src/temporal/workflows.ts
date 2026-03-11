@@ -183,7 +183,8 @@ export async function supportSessionWorkflow(
 
     await activities.publishEscalation(
       sessionId,
-      'You have been connected to our support team. A human agent will be with you shortly.'
+      'Your request has been escalated to our support team. A human agent will be with you shortly.',
+      'escalated'
     );
 
     const escalationSerial = await activities.notifyHumanAgent(sessionId, {
@@ -225,7 +226,8 @@ export async function supportSessionWorkflow(
           await activities.updateEscalationStatus(escalationSerial, 'resolved', sessionId);
           await activities.publishEscalation(
             sessionId,
-            'This conversation has been resolved by our support team. Thank you for contacting us!'
+            'This conversation has been resolved by our support team. Thank you for contacting us!',
+            'resolved'
           );
         } else if (decision.action === 'handback') {
           status = 'active';
