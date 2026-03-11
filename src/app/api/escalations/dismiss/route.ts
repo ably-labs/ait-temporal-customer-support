@@ -18,6 +18,9 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'ABLY_API_KEY not configured' }, { status: 500 });
   }
 
+  // SIMPLIFICATION OPPORTUNITY: updateMessage() requires a Realtime connection.
+  // The SDK should expose this via the REST API so server-side code doesn't need
+  // a WebSocket for a one-shot status update.
   const realtime = new Ably.Realtime({ key: apiKey });
   try {
     const channel = realtime.channels.get('ai:agent:escalations');

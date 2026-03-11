@@ -39,6 +39,17 @@ export function closeRealtimeClient(): void {
 // so that presence is scoped per-session and works correctly across multiple
 // Temporal workers. Cached by sessionId so the same session reuses the same
 // client within a worker.
+//
+// Design choice: We use a Map rather than per-activity client creation because
+// multiple activities within the same session (callLLMStreaming, executeToolCall)
+// need the same connection for presence continuity. The Map ensures the same
+// clientId reuses the same connection within a worker. Cleanup happens when the
+// workflow completes (cleanupSessionClient activity) or on worker shutdown.
+//
+// SIMPLIFICATION OPPORTUNITY: Each agent session needs its own Realtime client
+// for streaming, subscribing, and presence. The SDK should provide connection
+// pooling with identity isolation — one pooled connection, multiple independent
+// clientIds with their own presence and message identity.
 const sessionClients = new Map<string, Ably.Realtime>();
 
 export function getSessionRealtimeClient(sessionId: string): Ably.Realtime {

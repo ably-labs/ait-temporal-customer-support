@@ -15,6 +15,11 @@
  * `channel.subscribeAccumulated(callback)` that emits materialised messages
  * instead of raw operations. The logic is simple, but it's still boilerplate
  * that every developer using message-per-response will write.
+ *
+ * SIMPLIFICATION OPPORTUNITY: Every AI Transport consumer writes this same
+ * accumulation logic. The SDK should provide a built-in
+ * `channel.subscribeAccumulated()` helper that handles fragment assembly and
+ * terminal status detection.
  */
 
 import type Ably from 'ably';
@@ -47,6 +52,8 @@ export class MessageAccumulator {
 
     const data = typeof message.data === 'string' ? message.data : '';
     const action = message.action ?? 'message.create';
+    // SIMPLIFICATION OPPORTUNITY: Consumers must manually check message status to
+    // detect terminal states. The SDK should provide built-in terminal status detection.
     const headerStatus = (message.extras?.headers as Record<string, string>)?.status;
     const isComplete = headerStatus === 'complete' || headerStatus === 'stopped';
 

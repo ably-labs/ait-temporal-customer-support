@@ -126,6 +126,10 @@ export async function callLLMStreaming(
   const realtimeChannel = realtime.channels.get(channelName(sessionId));
   const restChannel = rest.channels.get(channelName(sessionId));
 
+  // SIMPLIFICATION OPPORTUNITY: Presence is connection+clientId scoped, so durable
+  // execution steps must re-enter presence. The SDK should support multiple presence
+  // identities on a single connection.
+  //
   // Enter presence using the per-session client so the frontend sees the agent as active.
   // This ensures enter/leave happen on the same connection even across Temporal retries.
   const sessionClient = getSessionRealtimeClient(sessionId);
