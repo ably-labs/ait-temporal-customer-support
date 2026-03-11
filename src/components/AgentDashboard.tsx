@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useChannel } from 'ably/react';
+import { useChannel, usePresence } from 'ably/react';
 import { ChannelProvider } from 'ably/react';
 import type Ably from 'ably';
 import Link from 'next/link';
@@ -35,6 +35,10 @@ function SessionConversation({ sessionId }: { sessionId: string }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [accumulator] = useState(() => new MessageAccumulator());
   const channelName = `ai:support:${sessionId}`;
+
+  // Enter presence so the customer sees "Support agent is online" in their chat.
+  // Auto-leaves on unmount (agent navigates away or collapses the conversation).
+  usePresence(channelName, { role: 'human-agent' });
 
   const handleMessage = useCallback(
     (message: Ably.Message) => {
@@ -374,24 +378,32 @@ function EscalationList() {
                   onChange={(e) =>
                     setResponseText((prev) => ({ ...prev, [esc.sessionId]: e.target.value }))
                   }
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      if (responseText[esc.sessionId]?.trim() && !sending[esc.sessionId]) {
+                        respond(esc.sessionId, 'respond');
+                      }
+                    }
+                  }}
                   placeholder="Type your response..."
                   className="w-full rounded-lg border border-zinc-300 dark:border-zinc-600 bg-transparent px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500 resize-none"
                   rows={2}
                 />
                 <div className="flex gap-2 justify-end">
                   <button
-                    onClick={() => respond(esc.sessionId, 'respond')}
+                    onClick={() => respond(esc.sessionId, 'resolve')}
                     disabled={sending[esc.sessionId] || !responseText[esc.sessionId]?.trim()}
                     className="rounded-lg border border-zinc-300 dark:border-zinc-600 px-4 py-1.5 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-800 disabled:opacity-50 transition-colors"
                   >
-                    Respond
+                    Resolve
                   </button>
                   <button
-                    onClick={() => respond(esc.sessionId, 'resolve')}
+                    onClick={() => respond(esc.sessionId, 'respond')}
                     disabled={sending[esc.sessionId] || !responseText[esc.sessionId]?.trim()}
-                    className="rounded-lg bg-green-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-50 transition-colors"
+                    className="rounded-lg bg-blue-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 transition-colors"
                   >
-                    Resolve
+                    Respond
                   </button>
                 </div>
               </div>
