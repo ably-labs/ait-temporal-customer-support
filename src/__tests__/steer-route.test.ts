@@ -14,12 +14,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // --- Mocks ---
 // Use vi.hoisted to create mock functions that can be referenced inside vi.mock factories
 
-const { mockPublish, mockChannelsGet, mockSignal, mockGetHandle } = vi.hoisted(() => {
+const { mockPublish, mockChannelsGet, mockSignal, mockGetHandle, mockClassifyIntent, mockWorkflowStart } = vi.hoisted(() => {
   const mockPublish = vi.fn().mockResolvedValue(undefined);
   const mockChannelsGet = vi.fn().mockReturnValue({ publish: mockPublish });
   const mockSignal = vi.fn().mockResolvedValue(undefined);
   const mockGetHandle = vi.fn().mockReturnValue({ signal: mockSignal });
-  return { mockPublish, mockChannelsGet, mockSignal, mockGetHandle };
+  const mockClassifyIntent = vi.fn().mockResolvedValue('steer');
+  const mockWorkflowStart = vi.fn().mockResolvedValue(undefined);
+  return { mockPublish, mockChannelsGet, mockSignal, mockGetHandle, mockClassifyIntent, mockWorkflowStart };
 });
 
 vi.mock('ably', () => {
@@ -31,8 +33,13 @@ vi.mock('ably', () => {
 
 vi.mock('@/lib/temporal-client', () => ({
   getTemporalClient: vi.fn().mockResolvedValue({
-    workflow: { getHandle: mockGetHandle },
+    workflow: { getHandle: mockGetHandle, start: mockWorkflowStart },
   }),
+  TASK_QUEUE: 'support-copilot',
+}));
+
+vi.mock('@/lib/classify-intent', () => ({
+  classifyIntent: (...args: unknown[]) => mockClassifyIntent(...args),
 }));
 
 // Must import AFTER mocks are set up
@@ -57,6 +64,8 @@ describe('Steer API route (Temporal)', () => {
     mockGetHandle.mockReturnValue({ signal: mockSignal });
     mockPublish.mockResolvedValue(undefined);
     mockSignal.mockResolvedValue(undefined);
+    mockClassifyIntent.mockResolvedValue('steer');
+    mockWorkflowStart.mockResolvedValue(undefined);
     process.env.ABLY_API_KEY = 'test-app.test-key:test-secret';
   });
 
@@ -86,7 +95,8 @@ describe('Steer API route (Temporal)', () => {
   });
 
   describe('newMessage action', () => {
-    it('publishes control message AND signals Temporal workflow with text and messageId', async () => {
+    it('publishes user message + control message and signals Temporal when intent is steer', async () => {
+      mockClassifyIntent.mockResolvedValue('steer');
       const res = await POST(
         makeRequest({
           action: 'newMessage',
@@ -97,8 +107,16 @@ describe('Steer API route (Temporal)', () => {
       );
       expect(res.status).toBe(200);
 
-      // Should publish one Ably message: the ephemeral control message
-      expect(mockPublish).toHaveBeenCalledTimes(1);
+      // Should publish two Ably messages: user message + ephemeral control
+      expect(mockPublish).toHaveBeenCalledTimes(2);
+      // First: user message
+      expect(mockPublish).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'user',
+          data: 'Track order 127',
+        })
+      );
+      // Second: ephemeral control message
       expect(mockPublish).toHaveBeenCalledWith(
         expect.objectContaining({
           name: 'control',
@@ -107,11 +125,80 @@ describe('Steer API route (Temporal)', () => {
         })
       );
 
-      // Should signal the Temporal workflow with full payload
+      // Should signal the Temporal workflow
       expect(mockSignal).toHaveBeenCalledWith('steerGeneration', {
         action: 'newMessage',
         text: 'Track order 127',
         messageId: 'msg_127',
+      });
+
+      // Should have classified intent
+      expect(mockClassifyIntent).toHaveBeenCalledWith('Track order 127', '');
+    });
+
+    it('starts a one-shot workflow when intent is double-text', async () => {
+      mockClassifyIntent.mockResolvedValue('double-text');
+      const res = await POST(
+        makeRequest({
+          action: 'newMessage',
+          text: 'Also check my refund',
+          messageId: 'msg_128',
+        }),
+        { params }
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.intent).toBe('double-text');
+      expect(body.taskId).toBeDefined();
+
+      // Should publish user message but NOT control message
+      expect(mockPublish).toHaveBeenCalledTimes(1);
+      expect(mockPublish).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'user', data: 'Also check my refund' })
+      );
+
+      // Should NOT signal the main workflow
+      expect(mockSignal).not.toHaveBeenCalled();
+
+      // Should start a one-shot workflow
+      expect(mockWorkflowStart).toHaveBeenCalledWith(
+        'oneShotWorkflow',
+        expect.objectContaining({
+          taskQueue: 'support-copilot',
+          args: expect.arrayContaining(['test-session', expect.any(String), 'Also check my refund']),
+        })
+      );
+    });
+
+    it('sends stop signal when intent is classified as stop', async () => {
+      mockClassifyIntent.mockResolvedValue('stop');
+      const res = await POST(
+        makeRequest({
+          action: 'newMessage',
+          text: 'never mind, stop',
+          messageId: 'msg_129',
+        }),
+        { params }
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.intent).toBe('stop');
+
+      // Should publish user message + control stop message
+      expect(mockPublish).toHaveBeenCalledTimes(2);
+      expect(mockPublish).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'control',
+          data: JSON.stringify({ action: 'stop', text: 'never mind, stop' }),
+          extras: { ephemeral: true },
+        })
+      );
+
+      // Should signal stop to Temporal
+      expect(mockSignal).toHaveBeenCalledWith('steerGeneration', {
+        action: 'stop',
+        text: 'never mind, stop',
+        messageId: 'msg_129',
       });
     });
   });

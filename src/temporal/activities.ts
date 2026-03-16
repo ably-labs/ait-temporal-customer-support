@@ -51,8 +51,8 @@ export interface LLMResult {
 export interface Activities {
   publishUserMessage(sessionId: string, message: string, customerName: string, messageId: string): Promise<void>;
   publishAgentMessage(sessionId: string, message: string, messageId: string): Promise<void>;
-  callLLMStreaming(sessionId: string, messages: Message[], turnIndex: number): Promise<LLMResult>;
-  executeToolCall(sessionId: string, toolName: string, toolInput: Record<string, unknown>): Promise<unknown>;
+  callLLMStreaming(sessionId: string, messages: Message[], turnIndex: number, taskId?: string): Promise<LLMResult>;
+  executeToolCall(sessionId: string, toolName: string, toolInput: Record<string, unknown>, taskId?: string): Promise<unknown>;
   publishEscalation(sessionId: string, reason: string, type?: 'escalated' | 'resolved'): Promise<void>;
   notifyHumanAgent(
     sessionId: string,
@@ -117,7 +117,8 @@ export async function publishAgentMessage(
 export async function callLLMStreaming(
   sessionId: string,
   messages: Message[],
-  turnIndex: number
+  turnIndex: number,
+  taskId?: string
 ): Promise<LLMResult> {
   const attempt = Context.current().info.attempt;
   const realtime = getRealtimeClient();
@@ -130,7 +131,7 @@ export async function callLLMStreaming(
   // connection pooling with identity isolation.
   //
   // Enter presence using a per-activity session client so the frontend sees the agent as active.
-  const sessionClient = createSessionRealtimeClient(sessionId);
+  const sessionClient = createSessionRealtimeClient(sessionId, taskId);
   const presenceChannel = sessionClient.channels.get(channelName(sessionId));
 
   let handedOver = false;
@@ -222,7 +223,7 @@ export async function callLLMStreaming(
     const terminalStatus = aborted ? 'stopped' : 'complete';
     await realtimeChannel.updateMessage({
       serial: msgSerial,
-      extras: { headers: { status: terminalStatus, next: llmResult.type } },
+      extras: { headers: { status: terminalStatus, next: llmResult.type, ...(taskId ? { taskId } : {}) } },
     });
 
     // If aborted by cancellation, leave presence and rethrow
@@ -268,7 +269,8 @@ export async function callLLMStreaming(
 export async function executeToolCall(
   sessionId: string,
   toolName: string,
-  toolInput: Record<string, unknown>
+  toolInput: Record<string, unknown>,
+  taskId?: string
 ): Promise<unknown> {
   const realtime = getRealtimeClient();
   const channel = realtime.channels.get(channelName(sessionId));
@@ -278,7 +280,7 @@ export async function executeToolCall(
   // connection pooling with identity isolation.
   //
   // Enter presence using a per-activity session client
-  const sessionClient = createSessionRealtimeClient(sessionId);
+  const sessionClient = createSessionRealtimeClient(sessionId, taskId);
   const presenceChannel = sessionClient.channels.get(channelName(sessionId));
 
   let handedOver = false;
@@ -296,7 +298,7 @@ export async function executeToolCall(
     // Publish tool call start
     const result = await channel.publish({
       name: 'tool',
-      data: JSON.stringify({ toolName, input: toolInput, status: 'calling' }),
+      data: JSON.stringify({ toolName, input: toolInput, status: 'calling', ...(taskId ? { taskId } : {}) }),
     });
     const serial = result.serials[0];
 

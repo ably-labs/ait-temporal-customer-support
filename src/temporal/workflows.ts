@@ -4,6 +4,9 @@ import {
 } from '@temporalio/workflow';
 import type { Activities } from './activities';
 
+// Re-export one-shot workflow so it's included in the workflow bundle
+export { oneShotWorkflow } from './one-shot-workflow';
+
 // Signal definitions
 export const userMessage = defineSignal<[string, string]>('userMessage');
 export const humanAgentResponse = defineSignal<[{ action: string; message?: string }]>('humanAgentResponse');

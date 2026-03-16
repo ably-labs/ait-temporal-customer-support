@@ -15,7 +15,8 @@ interface ChatMessage {
   isStreaming: boolean;
   source?: 'human-agent'; // set when a human agent sends the message
   escalationType?: 'escalated' | 'resolved'; // from extras.headers['x-escalation-type']
-  toolData?: { toolName: string; input: Record<string, unknown>; status: string; result?: unknown; progress?: { step: number; total: number; label: string } };
+  toolData?: { toolName: string; input: Record<string, unknown>; status: string; result?: unknown; progress?: { step: number; total: number; label: string }; taskId?: string };
+  taskId?: string; // present for parallel (double-text) agent responses
 }
 
 interface Props {
@@ -136,12 +137,13 @@ export default function ChatSession({ sessionId }: Props) {
         const source = headers?.source === 'human-agent'
           ? 'human-agent' as const
           : undefined;
+        const responseTaskId = headers?.taskId;
         setMessages((prev) => {
           const existing = prev.find((m) => m.id === serial);
           if (existing) {
             return prev.map((m) =>
               m.id === serial
-                ? { ...m, content: result.data, isStreaming: !result.isComplete, source: source ?? m.source }
+                ? { ...m, content: result.data, isStreaming: !result.isComplete, source: source ?? m.source, taskId: responseTaskId ?? m.taskId }
                 : m
             );
           }
@@ -154,6 +156,7 @@ export default function ChatSession({ sessionId }: Props) {
               content: result.data,
               isStreaming: !result.isComplete,
               source,
+              taskId: responseTaskId,
             },
           ];
         });
@@ -174,16 +177,17 @@ export default function ChatSession({ sessionId }: Props) {
         if (toolData?.status === 'cancelled') {
           clearHandover();
         }
+        const toolTaskId = toolData?.taskId;
         setMessages((prev) => {
           const existing = prev.find((m) => m.id === serial);
           if (existing) {
             return prev.map((m) =>
-              m.id === serial ? { ...m, toolData, content: result.data } : m
+              m.id === serial ? { ...m, toolData, content: result.data, taskId: toolTaskId ?? m.taskId } : m
             );
           }
           return [
             ...prev,
-            { id: serial, type: 'tool', role: 'system', content: result.data, isStreaming: false, toolData },
+            { id: serial, type: 'tool', role: 'system', content: result.data, isStreaming: false, toolData, taskId: toolTaskId },
           ];
         });
         return;
@@ -273,6 +277,9 @@ export default function ChatSession({ sessionId }: Props) {
     }
   };
 
+  // Derive a summary of the current task from the last user message (for intent classification)
+  const currentTaskSummary = [...messages].reverse().find((m) => m.role === 'user')?.content || '';
+
   const sendMessageWhileStreaming = async (text: string) => {
     const messageId = `user_${sessionId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     // Optimistic UI
@@ -286,7 +293,7 @@ export default function ChatSession({ sessionId }: Props) {
       await fetch(`/api/sessions/${sessionId}/steer`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'newMessage', text, messageId }),
+        body: JSON.stringify({ action: 'newMessage', text, messageId, currentTaskSummary }),
       });
     } catch (err) {
       console.error('Failed to steer:', err);
@@ -339,6 +346,59 @@ export default function ChatSession({ sessionId }: Props) {
           </p>
         )}
         {messages.map((msg) => {
+          // Parallel agent card (double-text) — indigo border to distinguish from main agent
+          if (msg.taskId && msg.type === 'text' && msg.role === 'assistant') {
+            if (!msg.content && !msg.isStreaming) return null;
+            return (
+              <div key={msg.id} className="flex justify-start">
+                <div className="max-w-[75%] space-y-1">
+                  <div className="flex items-center gap-1.5 ml-1 mb-0.5">
+                    <span className="w-2 h-2 rounded-full bg-indigo-500" />
+                    <span className="text-xs font-medium text-indigo-700 dark:text-indigo-400">
+                      Parallel Agent
+                    </span>
+                  </div>
+                  <div className="rounded-xl px-4 py-2.5 text-sm leading-relaxed whitespace-pre-wrap bg-indigo-50 dark:bg-indigo-900/20 text-foreground border border-indigo-200 dark:border-indigo-800">
+                    {msg.content}
+                    {msg.isStreaming && (
+                      <span className="inline-block w-1.5 h-4 ml-0.5 bg-current opacity-60 animate-pulse" />
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          }
+
+          // Parallel agent tool card (double-text)
+          if (msg.taskId && msg.type === 'tool') {
+            const tool = msg.toolData;
+            return (
+              <div key={msg.id} className="flex justify-start">
+                <div className="max-w-[75%] rounded-xl border border-indigo-200 dark:border-indigo-700 px-4 py-3 text-sm">
+                  <div className="flex items-center gap-2 text-indigo-500 text-xs font-medium mb-1.5">
+                    <span className="w-2 h-2 rounded-full bg-indigo-500" />
+                    <span className="font-mono">{tool?.toolName}</span>
+                    {tool?.status === 'calling' && (
+                      <span className="animate-pulse">
+                        {tool.progress
+                          ? `${tool.progress.label} (${tool.progress.step}/${tool.progress.total})`
+                          : 'running...'}
+                      </span>
+                    )}
+                    {tool?.status === 'complete' && (
+                      <span className="text-green-600 dark:text-green-400">done</span>
+                    )}
+                  </div>
+                  {tool?.status === 'complete' && tool.result != null && (
+                    <pre className="text-xs text-zinc-600 dark:text-zinc-400 bg-zinc-50 dark:bg-zinc-900 rounded p-2 overflow-x-auto">
+                      {JSON.stringify(tool.result, null, 2)}
+                    </pre>
+                  )}
+                </div>
+              </div>
+            );
+          }
+
           // Tool call card
           if (msg.type === 'tool') {
             const tool = msg.toolData;
