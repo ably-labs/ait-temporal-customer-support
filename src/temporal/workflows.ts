@@ -4,10 +4,14 @@ import {
 } from '@temporalio/workflow';
 import type { Activities } from './activities';
 
+// Re-export the one-shot workflow so the worker bundle includes it
+export { oneShotWorkflow } from './one-shot-workflow';
+
 // Signal definitions
 export const userMessage = defineSignal<[string, string]>('userMessage');
 export const humanAgentResponse = defineSignal<[{ action: string; message?: string }]>('humanAgentResponse');
 export const steerGeneration = defineSignal<[{ action: 'stop' | 'newMessage'; text?: string; messageId?: string }]>('steerGeneration');
+export const mergeContext = defineSignal<[{ messages: Message[] }]>('mergeContext');
 
 
 export interface Message {
@@ -56,6 +60,11 @@ export async function supportSessionWorkflow(
     if (activeLLMScope) {
       activeLLMScope.cancel();
     }
+  });
+
+  // Merge context from one-shot (double-text) workflows back into the primary conversation
+  setHandler(mergeContext, (merge) => {
+    messages.push(...merge.messages);
   });
 
   let turnIndex = 0;

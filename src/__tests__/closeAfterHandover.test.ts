@@ -26,6 +26,7 @@ function createMockSessionClient() {
   const client = {
     channels,
     close: vi.fn(),
+    auth: { clientId: 'ai-agent:test-session-self' },
   };
 
   return {

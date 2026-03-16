@@ -30,7 +30,7 @@ export default function ChatSession({ sessionId }: Props) {
   const channelName = `ai:support:${sessionId}`;
 
   // Track AI agent presence with handover-aware logic (extracted to reusable hook)
-  const { agentStatus, agentWorking: agentPresent, clearHandover } = useAgentPresence(channelName);
+  const { agentStatus, agentWorking: agentPresent, agents, clearHandover } = useAgentPresence(channelName);
   // Track human support agent presence (simple: present or not)
   const { humanAgentPresent } = useHumanAgentPresence(channelName);
 
@@ -273,6 +273,11 @@ export default function ChatSession({ sessionId }: Props) {
     }
   };
 
+  // Derive a summary of the current task from the last user message (for intent classification)
+  const currentTaskSummary = [...messages].reverse().find(
+    (m) => m.role === 'user'
+  )?.content ?? '';
+
   const sendMessageWhileStreaming = async (text: string) => {
     const messageId = `user_${sessionId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     // Optimistic UI
@@ -286,7 +291,7 @@ export default function ChatSession({ sessionId }: Props) {
       await fetch(`/api/sessions/${sessionId}/steer`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'newMessage', text, messageId }),
+        body: JSON.stringify({ action: 'newMessage', text, messageId, currentTaskSummary }),
       });
     } catch (err) {
       console.error('Failed to steer:', err);
@@ -322,7 +327,11 @@ export default function ChatSession({ sessionId }: Props) {
       {!agentCrashed && !humanAgentPresent && agentPresent && (
         <div className="bg-blue-50 dark:bg-blue-900/20 border-b border-blue-200 dark:border-blue-800 px-4 py-2 text-sm text-blue-700 dark:text-blue-300 flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
-          AI is thinking...
+          {agents.length > 1
+            ? `AI is working on ${agents.length} tasks in parallel...`
+            : agents.some((a) => a.presenceStatus === 'waiting-to-deliver')
+              ? 'AI is preparing a response...'
+              : 'AI is thinking...'}
         </div>
       )}
       {!agentCrashed && !humanAgentPresent && !agentPresent && isEscalated && (

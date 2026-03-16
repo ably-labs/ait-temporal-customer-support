@@ -3,6 +3,7 @@ config({ path: '.env.local' });
 
 import { NativeConnection, Worker } from '@temporalio/worker';
 import * as activities from './activities';
+import * as oneShotActivities from './one-shot-activities';
 import { closeRealtimeClient } from './ably-clients';
 
 async function run() {
@@ -15,7 +16,7 @@ async function run() {
     namespace: process.env.TEMPORAL_NAMESPACE ?? 'default',
     taskQueue: 'support-copilot',
     workflowsPath: require.resolve('./workflows'),
-    activities,
+    activities: { ...activities, ...oneShotActivities },
   });
 
   console.log('Temporal worker started, listening on task queue: support-copilot');

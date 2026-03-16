@@ -1,6 +1,6 @@
 /**
  * useAgentPresence — client-side hook for tracking agent presence across
- * serverless step boundaries.
+ * serverless step boundaries with multi-agent (double-text) support.
  *
  * Problem: In serverless durable execution (Vercel WDK, AWS Lambda, etc.),
  * each workflow step may run on a different invocation with a different Ably
@@ -13,29 +13,20 @@
  * between steps, not crashed. This hook interprets that signal and maintains
  * a stable agent status across step transitions.
  *
+ * Multi-agent support: When double-texting creates parallel one-shot workflows,
+ * each gets its own taskId-scoped presence member (ai-agent:session:taskId).
+ * This hook tracks per-taskId state and exposes an `agents` array.
+ *
  * State resolution uses "best of" logic — if multiple presence members exist
  * for the same agent (e.g., overlapping enter/leave from different connections),
  * the most positive state wins:
  *   processing > handing-over > absent
  *
- * This ensures the UI never briefly flickers to "disconnected" during normal
- * step transitions, even if events arrive out of order.
- *
  * SIMPLIFICATION OPPORTUNITY: Presence is connection+clientId scoped, so
  * durable execution steps must re-enter presence. The SDK should support
  * multiple presence identities on a single connection.
  *
- * NOTE: This pattern is common enough that we believe it should be an SDK-level
- * primitive — something like `channel.subscribeAgentPresence()` that handles
- * handover semantics automatically. The logic here is straightforward but it's
- * boilerplate that every developer building AI agents on serverless will write.
- *
  * Known limitation: On page reload, the in-memory handover state is lost.
- * If the agent was between steps at reload time, the client sees "absent"
- * briefly until the next step enters presence. A server-side agent status
- * API (or LiveObjects with short TTL) would solve this, but adds complexity.
- * For most use cases, the brief flash on reload is acceptable — the next step
- * typically enters within milliseconds.
  */
 
 'use client';
@@ -46,6 +37,12 @@ import type Ably from 'ably';
 
 export type AgentStatus = 'active' | 'handing-over' | 'absent';
 
+export interface AgentInfo {
+  taskId: string;
+  status: AgentStatus;
+  presenceStatus?: string;
+}
+
 interface UseAgentPresenceOptions {
   /** Prefix to match agent clientIds (default: 'ai-agent') */
   agentClientIdPrefix?: string;
@@ -54,13 +51,26 @@ interface UseAgentPresenceOptions {
 }
 
 interface UseAgentPresenceResult {
-  /** Resolved agent status — stable across step transitions */
+  /** Resolved agent status — stable across step transitions (considers all agents) */
   agentStatus: AgentStatus;
-  /** Whether the agent is actively working (status is 'active' or 'handing-over') */
+  /** Whether any agent is actively working (status is 'active' or 'handing-over') */
   agentWorking: boolean;
-  /** Clear the handover state immediately — call when you know the turn is done
-   *  (e.g., a message received terminal 'complete'/'stopped' status) */
+  /** Per-agent status for multi-agent scenarios */
+  agents: AgentInfo[];
+  /** Clear the handover state immediately — call when you know the turn is done */
   clearHandover: () => void;
+}
+
+/**
+ * Extract taskId from a clientId like "ai-agent:session:taskId".
+ * Returns 'primary' for "ai-agent:session" (no taskId suffix).
+ */
+function extractTaskId(clientId: string, sessionPrefix: string): string {
+  const afterPrefix = clientId.slice(sessionPrefix.length);
+  if (!afterPrefix || afterPrefix === '') return 'primary';
+  // afterPrefix starts with ':' if there's a taskId
+  if (afterPrefix.startsWith(':')) return afterPrefix.slice(1);
+  return 'primary';
 }
 
 export function useAgentPresence(
@@ -72,42 +82,84 @@ export function useAgentPresence(
     handoverTimeoutMs = 10_000,
   } = options;
 
-  const [handingOver, setHandingOver] = useState(false);
-  const handoverTimeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined);
-  // When clearHandover() is called (e.g., response got terminal status), suppress
-  // subsequent handover leaves until a new enter event. This prevents the race where
-  // the terminal status update arrives before the presence leave — clearHandover()
-  // fires, then the leave re-arms handover for up to 10s.
+  // Track handover state per taskId
+  const [handingOverMap, setHandingOverMap] = useState<Map<string, boolean>>(new Map());
+  const handoverTimeoutRefs = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const suppressHandoverRef = useRef(false);
 
   const onPresenceEvent = useCallback(
     (event: Ably.PresenceMessage) => {
-      // Only process events for agent clientIds
       if (!event.clientId?.startsWith(agentClientIdPrefix)) return;
+
+      // Extract the session prefix to determine taskId
+      // clientId format: ai-agent:SESSION or ai-agent:SESSION:TASKID
+      const parts = event.clientId.split(':');
+      const sessionPrefix = `${parts[0]}:${parts[1]}`;
+      const taskId = extractTaskId(event.clientId, sessionPrefix);
 
       if (event.action === 'leave') {
         const data = event.data as Record<string, unknown> | undefined;
+
+        // 'delivered' leave means task is done — don't trigger handover
+        if (data?.status === 'delivered') {
+          setHandingOverMap((prev) => {
+            const next = new Map(prev);
+            next.delete(taskId);
+            return next;
+          });
+          const timer = handoverTimeoutRefs.current.get(taskId);
+          if (timer) {
+            clearTimeout(timer);
+            handoverTimeoutRefs.current.delete(taskId);
+          }
+          return;
+        }
+
         if (data?.status === 'handing-over' && !suppressHandoverRef.current) {
-          // Explicit handover — agent is between steps, expect re-enter soon
-          setHandingOver(true);
-          clearTimeout(handoverTimeoutRef.current);
-          handoverTimeoutRef.current = setTimeout(() => {
-            setHandingOver(false);
-            // After timeout, status falls through to 'absent'
-            // depending on message terminal status (handled by the consumer)
+          setHandingOverMap((prev) => {
+            const next = new Map(prev);
+            next.set(taskId, true);
+            return next;
+          });
+
+          const existingTimer = handoverTimeoutRefs.current.get(taskId);
+          if (existingTimer) clearTimeout(existingTimer);
+
+          const timer = setTimeout(() => {
+            setHandingOverMap((prev) => {
+              const next = new Map(prev);
+              next.delete(taskId);
+              return next;
+            });
+            handoverTimeoutRefs.current.delete(taskId);
           }, handoverTimeoutMs);
+          handoverTimeoutRefs.current.set(taskId, timer);
         } else {
-          // Non-handover leave, or suppressed after clearHandover()
-          setHandingOver(false);
-          clearTimeout(handoverTimeoutRef.current);
+          setHandingOverMap((prev) => {
+            const next = new Map(prev);
+            next.delete(taskId);
+            return next;
+          });
+          const timer = handoverTimeoutRefs.current.get(taskId);
+          if (timer) {
+            clearTimeout(timer);
+            handoverTimeoutRefs.current.delete(taskId);
+          }
         }
       }
 
       if (event.action === 'enter' || event.action === 'update') {
-        // Agent (re-)entered — clear any pending handover timeout and reset suppress
         suppressHandoverRef.current = false;
-        setHandingOver(false);
-        clearTimeout(handoverTimeoutRef.current);
+        setHandingOverMap((prev) => {
+          const next = new Map(prev);
+          next.delete(taskId);
+          return next;
+        });
+        const timer = handoverTimeoutRefs.current.get(taskId);
+        if (timer) {
+          clearTimeout(timer);
+          handoverTimeoutRefs.current.delete(taskId);
+        }
       }
     },
     [agentClientIdPrefix, handoverTimeoutMs]
@@ -115,26 +167,67 @@ export function useAgentPresence(
 
   const { presenceData } = usePresenceListener(channelName, onPresenceEvent);
 
-  // Cleanup timeout on unmount
+  // Cleanup timeouts on unmount
   useEffect(() => {
-    return () => clearTimeout(handoverTimeoutRef.current);
+    const refs = handoverTimeoutRefs.current;
+    return () => {
+      refs.forEach((timer) => clearTimeout(timer));
+    };
   }, []);
 
-  // Resolve agent status using "best of" logic across all matching members.
-  // Multiple members can exist when connections overlap during step transitions.
+  // Build per-agent status from presence data
   const agentMembers = presenceData.filter(
     (m) => m.clientId?.startsWith(agentClientIdPrefix)
   );
 
+  // Group by taskId
+  const taskIdMembers = new Map<string, Ably.PresenceMessage[]>();
+  for (const m of agentMembers) {
+    const parts = m.clientId!.split(':');
+    const sessionPrefix = `${parts[0]}:${parts[1]}`;
+    const taskId = extractTaskId(m.clientId!, sessionPrefix);
+    const existing = taskIdMembers.get(taskId) ?? [];
+    existing.push(m);
+    taskIdMembers.set(taskId, existing);
+  }
+
+  // Resolve status per taskId
+  const agents: AgentInfo[] = [];
+  const allTaskIds = new Set([...taskIdMembers.keys(), ...handingOverMap.keys()]);
+
+  for (const taskId of allTaskIds) {
+    const members = taskIdMembers.get(taskId) ?? [];
+    const isHandingOver = handingOverMap.get(taskId) ?? false;
+
+    let status: AgentStatus;
+    let presenceStatus: string | undefined;
+
+    if (members.some((m) => (m.data as Record<string, unknown>)?.status === 'processing')) {
+      status = 'active';
+      presenceStatus = 'processing';
+    } else if (members.some((m) => (m.data as Record<string, unknown>)?.status === 'waiting-to-deliver')) {
+      status = 'active';
+      presenceStatus = 'waiting-to-deliver';
+    } else if (members.some((m) => (m.data as Record<string, unknown>)?.status === 'delivering')) {
+      status = 'active';
+      presenceStatus = 'delivering';
+    } else if (members.length > 0) {
+      status = 'active';
+    } else if (isHandingOver) {
+      status = 'handing-over';
+    } else {
+      // No members and not handing over — skip (agent is gone)
+      continue;
+    }
+
+    agents.push({ taskId, status, presenceStatus });
+  }
+
+  // Aggregate status: any agent active = active, any handing over = handing-over, else absent
   let agentStatus: AgentStatus;
-  if (agentMembers.some((m) => (m.data as Record<string, unknown>)?.status === 'processing')) {
-    // At least one member is actively processing — agent is working
+  if (agents.some((a) => a.status === 'active')) {
     agentStatus = 'active';
-  } else if (agentMembers.length > 0) {
-    // Members present but not processing (e.g., entering, updating)
-    agentStatus = 'active';
-  } else if (handingOver) {
-    // No members present, but a recent handover leave means a step transition
+  } else if (agents.some((a) => a.status === 'handing-over')) {
     agentStatus = 'handing-over';
   } else {
     agentStatus = 'absent';
@@ -143,11 +236,11 @@ export function useAgentPresence(
   const agentWorking = agentStatus === 'active' || agentStatus === 'handing-over';
 
   const clearHandover = useCallback(() => {
-    setHandingOver(false);
-    clearTimeout(handoverTimeoutRef.current);
-    // Suppress subsequent handover leaves until a new enter event
+    setHandingOverMap(new Map());
+    handoverTimeoutRefs.current.forEach((timer) => clearTimeout(timer));
+    handoverTimeoutRefs.current.clear();
     suppressHandoverRef.current = true;
   }, []);
 
-  return { agentStatus, agentWorking, clearHandover };
+  return { agentStatus, agentWorking, agents, clearHandover };
 }

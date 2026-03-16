@@ -47,13 +47,14 @@ export function closeRealtimeClient(): void {
 // client (~100-300ms connection overhead per activity). The SDK should provide
 // connection pooling with identity isolation — one pooled connection, multiple
 // independent clientIds with their own presence and message identity.
-export function createSessionRealtimeClient(sessionId: string): Ably.Realtime {
+export function createSessionRealtimeClient(sessionId: string, taskId?: string): Ably.Realtime {
+  const clientId = taskId ? `ai-agent:${sessionId}:${taskId}` : `ai-agent:${sessionId}`;
   return new Ably.Realtime({
     key: getApiKey(),
     // Prevents the agent from receiving its own messages. Future AI Transport SDK
     // versions may handle this automatically for agent connections.
     echoMessages: false,
-    clientId: `ai-agent:${sessionId}`,
+    clientId,
   });
 }
 
@@ -84,6 +85,10 @@ export async function closeAfterHandover(
   timeoutMs = 15_000,
 ): Promise<void> {
   const presenceChannel = sessionClient.channels.get(channel);
+  // Exclude self from the "new enter" detection — our own clientId should not
+  // satisfy the handover condition. This matters when taskId-scoped clients
+  // (e.g., ai-agent:session:taskA) overlap with the primary (ai-agent:session).
+  const selfClientId = sessionClient.auth.clientId;
 
   await new Promise<void>((resolve) => {
     const timer = setTimeout(() => {
@@ -92,8 +97,13 @@ export async function closeAfterHandover(
     }, timeoutMs);
 
     const onPresenceEvent = (member: Ably.PresenceMessage) => {
-      // A new activity entered presence — handover succeeded, safe to close
-      if (member.action === 'enter' && member.clientId?.startsWith('ai-agent:')) {
+      // A new activity entered presence — handover succeeded, safe to close.
+      // Exclude self so our own (re-)enter doesn't trigger premature close.
+      if (
+        member.action === 'enter' &&
+        member.clientId?.startsWith('ai-agent:') &&
+        member.clientId !== selfClientId
+      ) {
         clearTimeout(timer);
         presenceChannel.presence.unsubscribe(onPresenceEvent);
         resolve();
