@@ -280,7 +280,15 @@ export default function ChatSession({ sessionId }: Props) {
   // Derive a summary of the current task from the last user message (for intent classification)
   const currentTaskSummary = [...messages].reverse().find((m) => m.role === 'user')?.content || '';
 
+  // Guard against double-fire: Enter key can trigger both handleKeyDown and
+  // implicit button activation in the same event loop tick. React state updates
+  // (setInput('')) are batched, so the second call still sees the old input.
+  const steerSendingRef = useRef(false);
+
   const sendMessageWhileStreaming = async (text: string) => {
+    if (steerSendingRef.current) return;
+    steerSendingRef.current = true;
+
     const messageId = `user_${sessionId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     // Optimistic UI
     setMessages((prev) => [
@@ -297,6 +305,8 @@ export default function ChatSession({ sessionId }: Props) {
       });
     } catch (err) {
       console.error('Failed to steer:', err);
+    } finally {
+      steerSendingRef.current = false;
     }
   };
 
@@ -520,6 +530,7 @@ export default function ChatSession({ sessionId }: Props) {
               />
               {isAgentWorking ? (
                 <button
+                  type="button"
                   onClick={input.trim() ? () => sendMessageWhileStreaming(input.trim()) : stopGeneration}
                   className={`rounded-lg px-5 py-2.5 text-sm font-medium transition-colors ${
                     input.trim()
@@ -531,6 +542,7 @@ export default function ChatSession({ sessionId }: Props) {
                 </button>
               ) : (
                 <button
+                  type="button"
                   onClick={sendMessage}
                   disabled={sending || !input.trim()}
                   className="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"

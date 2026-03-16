@@ -4,9 +4,18 @@ import { classifyIntent } from '@/lib/classify-intent';
 import Ably from 'ably';
 
 /**
- * Steer or stop the AI generation mid-stream.
- * Dual delivery: ephemeral Ably message for instant pickup + Temporal signal as durable safety net.
- * For double-text: starts a parallel one-shot workflow instead of interrupting the current one.
+ * Steer, stop, or double-text the AI generation mid-stream.
+ *
+ * For 'stop': ephemeral Ably control + Temporal signal.
+ *
+ * For 'newMessage': classifies intent, then:
+ * - 'steer': abort via control + Temporal signal (workflow publishes user message)
+ * - 'double-text': start independent one-shot workflow
+ * - 'stop': same as explicit stop
+ *
+ * User message is NOT published to Ably here — the Temporal workflow's
+ * publishUserMessage activity handles that (with idempotent message ID
+ * matching the optimistic UI entry).
  */
 export async function POST(
   request: NextRequest,
@@ -29,71 +38,54 @@ export async function POST(
   const channel = rest.channels.get(`ai:support:${sessionId}`);
 
   if (action === 'stop') {
-    // Stop: ephemeral Ably control + Temporal signal
-    await channel.publish({ name: 'control', data: JSON.stringify({ action, text }), extras: { ephemeral: true } });
-
-    const workflowId = `support-${sessionId}`;
+    await channel.publish({ name: 'control', data: JSON.stringify({ action: 'stop' }), extras: { ephemeral: true } });
     const client = await getTemporalClient();
     try {
-      const handle = client.workflow.getHandle(workflowId);
-      await handle.signal('steerGeneration', { action, text, messageId });
+      const handle = client.workflow.getHandle(`support-${sessionId}`);
+      await handle.signal('steerGeneration', { action: 'stop' });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Unknown error';
-      console.warn(`Steer signal failed (workflow may be done): ${msg}`);
+      console.warn(`Steer signal failed: ${err instanceof Error ? err.message : 'Unknown'}`);
     }
-
     return NextResponse.json({ ok: true });
   }
 
   // action === 'newMessage'
-  // Publish the user message to Ably so it appears in chat immediately
-  await channel.publish({ name: 'user', data: text, clientId: `customer-${sessionId}` });
+  if (!text || !messageId) {
+    return NextResponse.json({ error: 'text and messageId required for newMessage' }, { status: 400 });
+  }
 
-  // Classify intent to decide: steer, double-text, or stop
-  const intent = await classifyIntent(text, currentTaskSummary || '');
+  // Classify: is this a redirect (steer), independent request (double-text), or stop?
+  const intent = await classifyIntent(text, currentTaskSummary ?? '');
 
   if (intent === 'double-text') {
-    // Start a parallel one-shot workflow — don't interrupt the main workflow
-    const taskId = `dt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    // Publish user message to Ably (one-shot workflow won't do this)
+    await channel.publish({ id: messageId, name: 'user', data: text });
+
+    const taskId = `dt_${Date.now()}`;
     const client = await getTemporalClient();
     await client.workflow.start('oneShotWorkflow', {
       taskQueue: TASK_QUEUE,
       workflowId: `oneshot-${sessionId}-${taskId}`,
       args: [sessionId, taskId, text],
     });
-
     return NextResponse.json({ ok: true, intent: 'double-text', taskId });
   }
 
-  if (intent === 'stop') {
-    // Classified as stop — same as explicit stop action
-    await channel.publish({ name: 'control', data: JSON.stringify({ action: 'stop', text }), extras: { ephemeral: true } });
+  // For 'steer' or 'stop': abort current step + signal workflow
+  const controlAction = intent === 'stop' ? 'stop' : 'newMessage';
+  await channel.publish({
+    name: 'control',
+    data: JSON.stringify({ action: controlAction, text }),
+    extras: { ephemeral: true },
+  });
 
-    const workflowId = `support-${sessionId}`;
-    const client = await getTemporalClient();
-    try {
-      const handle = client.workflow.getHandle(workflowId);
-      await handle.signal('steerGeneration', { action: 'stop', text, messageId });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Unknown error';
-      console.warn(`Steer signal failed (workflow may be done): ${msg}`);
-    }
-
-    return NextResponse.json({ ok: true, intent: 'stop' });
-  }
-
-  // intent === 'steer' — interrupt current generation with the new message
-  await channel.publish({ name: 'control', data: JSON.stringify({ action, text }), extras: { ephemeral: true } });
-
-  const workflowId = `support-${sessionId}`;
   const client = await getTemporalClient();
   try {
-    const handle = client.workflow.getHandle(workflowId);
-    await handle.signal('steerGeneration', { action, text, messageId });
+    const handle = client.workflow.getHandle(`support-${sessionId}`);
+    await handle.signal('steerGeneration', { action: controlAction, text, messageId });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Unknown error';
-    console.warn(`Steer signal failed (workflow may be done): ${msg}`);
+    console.warn(`Steer signal failed: ${err instanceof Error ? err.message : 'Unknown'}`);
   }
 
-  return NextResponse.json({ ok: true, intent: 'steer' });
+  return NextResponse.json({ ok: true, intent });
 }

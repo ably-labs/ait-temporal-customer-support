@@ -107,16 +107,9 @@ describe('Steer API route (Temporal)', () => {
       );
       expect(res.status).toBe(200);
 
-      // Should publish two Ably messages: user message + ephemeral control
-      expect(mockPublish).toHaveBeenCalledTimes(2);
-      // First: user message
-      expect(mockPublish).toHaveBeenCalledWith(
-        expect.objectContaining({
-          name: 'user',
-          data: 'Track order 127',
-        })
-      );
-      // Second: ephemeral control message
+      // Should publish one Ably message: ephemeral control
+      // (user message is published by the Temporal workflow's publishUserMessage activity)
+      expect(mockPublish).toHaveBeenCalledTimes(1);
       expect(mockPublish).toHaveBeenCalledWith(
         expect.objectContaining({
           name: 'control',
@@ -184,8 +177,9 @@ describe('Steer API route (Temporal)', () => {
       const body = await res.json();
       expect(body.intent).toBe('stop');
 
-      // Should publish user message + control stop message
-      expect(mockPublish).toHaveBeenCalledTimes(2);
+      // Should publish control stop message only
+      // (no user message — the workflow handles that)
+      expect(mockPublish).toHaveBeenCalledTimes(1);
       expect(mockPublish).toHaveBeenCalledWith(
         expect.objectContaining({
           name: 'control',
