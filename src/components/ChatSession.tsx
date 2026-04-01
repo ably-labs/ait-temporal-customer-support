@@ -14,7 +14,7 @@ interface ChatMessage {
   content: string;
   isStreaming: boolean;
   source?: 'human-agent'; // set when a human agent sends the message
-  escalationType?: 'escalated' | 'resolved'; // from extras.headers['x-escalation-type']
+  escalationType?: 'escalated' | 'resolved' | 'notice'; // from extras.headers['x-escalation-type']
   toolData?: { toolName: string; input: Record<string, unknown>; status: string; result?: unknown; progress?: { step: number; total: number; label: string }; taskId?: string };
   taskId?: string; // present for parallel (double-text) agent responses
 }
@@ -27,6 +27,12 @@ export default function ChatSession({ sessionId }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!sendError) return;
+    const t = setTimeout(() => setSendError(null), 5000);
+    return () => clearTimeout(t);
+  }, [sendError]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const channelName = `ai:support:${sessionId}`;
 
@@ -36,14 +42,19 @@ export default function ChatSession({ sessionId }: Props) {
   const { humanAgentPresent } = useHumanAgentPresence(channelName);
 
   // Crash detection state machine — derived from message status + presence.
-  // The last agent message's terminal status is the source of truth:
+  // The last agent-originated message's terminal status is the source of truth:
   //   - Has terminal status ('complete'/'stopped') → done
   //   - No terminal status + agent present         → working
   //   - No terminal status + agent absent          → crashed
-  const lastAgentMessage = [...messages].reverse().find(
-    (m) => m.type === 'text' && m.role === 'assistant'
+  // Checks both text responses AND tool calls — a crash during doResearch
+  // (a tool message) should also be detected.
+  const lastAgentActivity = [...messages].reverse().find(
+    (m) => (m.type === 'text' && m.role === 'assistant') ||
+           (m.type === 'tool' && m.toolData?.status !== 'complete' && m.toolData?.status !== 'cancelled')
   );
-  const hasUnterminated = lastAgentMessage?.isStreaming === true;
+  const hasUnterminated = lastAgentActivity?.type === 'tool'
+    ? lastAgentActivity.toolData?.status === 'calling'
+    : lastAgentActivity?.isStreaming === true;
   const agentCrashed = hasUnterminated && agentStatus === 'absent';
 
   // Show an in-chat notice when a human agent joins or leaves (presence-driven).
@@ -199,7 +210,7 @@ export default function ChatSession({ sessionId }: Props) {
         // header follows (e.g., escalation after tool execution, stop during tool).
         clearHandover();
         const escalationHeaders = result.extras?.headers as Record<string, string> | undefined;
-        const escalationType = escalationHeaders?.['x-escalation-type'] as 'escalated' | 'resolved' | undefined;
+        const escalationType = escalationHeaders?.['x-escalation-type'] as 'escalated' | 'resolved' | 'notice' | undefined;
         setMessages((prev) => {
           const existing = prev.find((m) => m.id === serial);
           if (existing) return prev;
@@ -232,6 +243,7 @@ export default function ChatSession({ sessionId }: Props) {
     // On the echo, we match by this ID instead of by content.
     const messageId = `user_${sessionId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
+    setSendError(null);
     // Optimistic UI — show immediately, keyed by messageId
     setMessages((prev) => [
       ...prev,
@@ -247,11 +259,17 @@ export default function ChatSession({ sessionId }: Props) {
         body: JSON.stringify({ message: text, messageId }),
       });
       if (!res.ok) {
-        const err = await res.json();
-        console.error('Failed to send message:', err);
+        console.error('Failed to send message:', await res.json());
+        // Remove optimistic message, restore text to input, flash error
+        setMessages((prev) => prev.filter((m) => m.id !== messageId));
+        setInput(text);
+        setSendError('Failed to send — server returned an error');
       }
     } catch (err) {
       console.error('Failed to send message:', err);
+      setMessages((prev) => prev.filter((m) => m.id !== messageId));
+      setInput(text);
+      setSendError('Failed to send — server may be offline');
     } finally {
       setSending(false);
     }
@@ -514,6 +532,12 @@ export default function ChatSession({ sessionId }: Props) {
         }
         return (
           <div className="border-t border-zinc-200 dark:border-zinc-700 p-4">
+            {sendError && (
+              <div className="max-w-3xl mx-auto mb-2 px-3 py-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-sm text-red-700 dark:text-red-300 flex items-center justify-between">
+                <span>{sendError}</span>
+                <button onClick={() => setSendError(null)} className="ml-2 text-red-400 hover:text-red-600">&times;</button>
+              </div>
+            )}
             <div className="flex gap-2 max-w-3xl mx-auto">
               <input
                 type="text"

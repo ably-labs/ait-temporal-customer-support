@@ -1,5 +1,5 @@
 import { Context, CancelledFailure } from '@temporalio/activity';
-import { getRealtimeClient, getRestClient, createSessionRealtimeClient, closeAfterHandover, channelName } from './ably-clients';
+import { getRealtimeClient, getRestClient, createSessionRealtimeClient, closeAfterHandover, channelName, untrackSessionClient } from './ably-clients';
 import { streamClaude } from './llm';
 import type { Message } from './workflows';
 
@@ -53,7 +53,7 @@ export interface Activities {
   publishAgentMessage(sessionId: string, message: string, messageId: string): Promise<void>;
   callLLMStreaming(sessionId: string, messages: Message[], turnIndex: number, taskId?: string): Promise<LLMResult>;
   executeToolCall(sessionId: string, toolName: string, toolInput: Record<string, unknown>, taskId?: string): Promise<unknown>;
-  publishEscalation(sessionId: string, reason: string, type?: 'escalated' | 'resolved'): Promise<void>;
+  publishEscalation(sessionId: string, reason: string, type?: 'escalated' | 'resolved' | 'notice'): Promise<void>;
   notifyHumanAgent(
     sessionId: string,
     context: { customerName: string; reason: string; history: Message[] }
@@ -257,6 +257,7 @@ export async function callLLMStreaming(
     // closeAfterHandover owns the connection in the handing-over path.
     // For error/cancellation paths, close immediately.
     if (!handedOver) {
+      untrackSessionClient(sessionClient);
       sessionClient.close();
     }
   }
@@ -288,6 +289,10 @@ export async function executeToolCall(
   try {
     await presenceChannel.presence.enter({ status: 'processing' });
 
+    const attempt = Context.current().info.attempt;
+    const rest = getRestClient();
+    const restChannel = rest.channels.get(channelName(sessionId));
+
     // Subscribe to control messages for live steering (stop/steer) — same pattern as callLLMStreaming
     const abortController = new AbortController();
     const controlHandler = () => {
@@ -295,12 +300,26 @@ export async function executeToolCall(
     };
     await channel.subscribe('control', controlHandler);
 
-    // Publish tool call start
-    const result = await channel.publish({
+    // Always use REST with deterministic ID for tool messages — idempotent
+    // create-if-not-exists on every attempt. Unlike LLM streaming (which benefits
+    // from the Realtime fast path for token appends), a tool call is a single
+    // publish so REST latency is negligible. This guarantees the same Ably message
+    // is reused across retries — no duplicates.
+    const activityId = Context.current().info.activityId;
+    const toolMessageId = `tool_${sessionId}_${activityId}`;
+    const initData = JSON.stringify({ toolName, input: toolInput, status: 'calling', ...(taskId ? { taskId } : {}) });
+
+    const publishResult = await restChannel.publish({
+      id: toolMessageId,
       name: 'tool',
-      data: JSON.stringify({ toolName, input: toolInput, status: 'calling', ...(taskId ? { taskId } : {}) }),
+      data: initData,
     });
-    const serial = result.serials[0];
+    const serial = publishResult.serials[0];
+
+    // On retry, clear any stale progress from the crashed attempt
+    if (attempt > 1 && serial) {
+      await channel.updateMessage({ serial, data: initData });
+    }
 
     let toolResult: unknown;
 
@@ -331,7 +350,15 @@ export async function executeToolCall(
           ];
           const topic = toolInput.topic as string;
 
-          for (let i = 0; i < steps.length; i++) {
+          // Resume from last heartbeat on retry — skip already-completed steps.
+          // Temporal stores the last heartbeat value; on attempt 2+ we read it
+          // to avoid re-running steps the user already saw complete.
+          const heartbeatDetails = Context.current().info.heartbeatDetails;
+          const startStep = heartbeatDetails
+            ? parseInt(String(heartbeatDetails).replace('step ', ''), 10)
+            : 0;
+
+          for (let i = startStep; i < steps.length; i++) {
             const step = steps[i];
             // Update tool message with current progress
             if (serial) {
@@ -407,6 +434,7 @@ export async function executeToolCall(
     return toolResult;
   } finally {
     if (!handedOver) {
+      untrackSessionClient(sessionClient);
       sessionClient.close();
     }
   }
@@ -422,7 +450,7 @@ export async function executeToolCall(
 export async function publishEscalation(
   sessionId: string,
   reason: string,
-  type: 'escalated' | 'resolved' = 'escalated'
+  type: 'escalated' | 'resolved' | 'notice' = 'escalated'
 ): Promise<void> {
   const rest = getRestClient();
   const channel = rest.channels.get(channelName(sessionId));

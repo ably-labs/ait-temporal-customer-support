@@ -25,9 +25,11 @@ export interface Message {
 
 const activities = proxyActivities<Activities>({
   startToCloseTimeout: '5 minutes',
-  heartbeatTimeout: '30 seconds',
+  heartbeatTimeout: '5 seconds',
   retry: {
     maximumAttempts: 3,
+    initialInterval: '1 second',
+    maximumInterval: '2 seconds',
   },
 });
 
@@ -166,11 +168,12 @@ export async function supportSessionWorkflow(
       if (action.action === 'newMessage' && action.text && action.messageId) {
         pendingUserMessage = { text: action.text, messageId: action.messageId };
       } else {
-        // 'stop' — notify the user via escalation notice
+        // 'stop' — notify the user via system notice (not a human escalation)
         await CancellationScope.nonCancellable(async () => {
           await activities.publishEscalation(
             sessionId,
-            'Generation stopped. Send a new message when you\'re ready.'
+            'Generation stopped. Send a new message when you\'re ready.',
+            'notice'
           );
         });
       }

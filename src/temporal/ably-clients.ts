@@ -47,14 +47,32 @@ export function closeRealtimeClient(): void {
 // client (~100-300ms connection overhead per activity). The SDK should provide
 // connection pooling with identity isolation — one pooled connection, multiple
 // independent clientIds with their own presence and message identity.
+
+// Track active session clients so we can close them on worker shutdown
+// (ensures presence leave events fire immediately instead of waiting for TCP timeout).
+const activeSessionClients = new Set<Ably.Realtime>();
+
 export function createSessionRealtimeClient(sessionId: string, taskId?: string): Ably.Realtime {
-  return new Ably.Realtime({
+  const client = new Ably.Realtime({
     key: getApiKey(),
     // Prevents the agent from receiving its own messages. Future AI Transport SDK
     // versions may handle this automatically for agent connections.
     echoMessages: false,
     clientId: taskId ? `ai-agent:${sessionId}:${taskId}` : `ai-agent:${sessionId}`,
   });
+  activeSessionClients.add(client);
+  return client;
+}
+
+export function untrackSessionClient(client: Ably.Realtime): void {
+  activeSessionClients.delete(client);
+}
+
+export function closeAllSessionClients(): void {
+  for (const client of activeSessionClients) {
+    client.close();
+  }
+  activeSessionClients.clear();
 }
 
 export function channelName(sessionId: string): string {
@@ -103,5 +121,6 @@ export async function closeAfterHandover(
     presenceChannel.presence.subscribe(onPresenceEvent);
   });
 
+  activeSessionClients.delete(sessionClient);
   sessionClient.close();
 }
